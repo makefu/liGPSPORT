@@ -23,8 +23,12 @@ from .proto import (
     cycling_data_pb2,
     dev_status_pb2,
     dev_ver_info_pb2,
+    firmware_pb2,
+    route_book_pb2,
+    route_plan_pb2,
     sensor_pb2,
     user_config_pb2,
+    wifi_pb2,
 )
 
 # Service+operation tuples that mutate persistent state on the device.
@@ -421,6 +425,201 @@ async def _r_sensors(
     return SensorList(sensors=tuple(sensors))
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class FirmwareInfo:
+    """Decoded ``FIRMWARE_OPERATE_TYPE_SEND_VERSION`` payload."""
+
+    mcu_firmware_ver: int
+    ble_firmware_ver: int
+    ble_boot_firmware_ver: int
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        return (
+            f"MCU firmware:        {self.mcu_firmware_ver}\n"
+            f"BLE firmware:        {self.ble_firmware_ver}\n"
+            f"BLE boot firmware:   {self.ble_boot_firmware_ver}"
+        )
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class WifiStatus:
+    """Decoded WIFI status reply."""
+
+    on: bool
+    ssid: str
+    signal_strength: int
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        return (
+            f"WiFi:            {'on' if self.on else 'off'}\n"
+            f"SSID:            {self.ssid or '(none)'}\n"
+            f"Signal:          {self.signal_strength}"
+        )
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class RoutePlan:
+    """One entry in the route_plan list."""
+
+    id: int
+    name: str
+    file_type: int  # ROUTE_PLAN_FILE_TYPE (CNX=1, GPX=2, FIT=3, TCX=4, XML=5...)
+    total_distance: int
+    status: int
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        kind = {1: "CNX", 2: "GPX", 3: "FIT", 4: "TCX"}.get(self.file_type, str(self.file_type))
+        return f"id={self.id} name={self.name!r} type={kind} distance={self.total_distance}m"
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class RouteList:
+    """List of routes (route_plan service)."""
+
+    routes: tuple[RoutePlan, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"routes": [r.to_dict() for r in self.routes]}
+
+    def format(self) -> str:
+        if not self.routes:
+            return "no routes on device"
+        return "\n".join(r.format() for r in self.routes)
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class RouteBookEntry:
+    """One entry in the route_book list."""
+
+    id: int
+    name: str
+    status: int
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        used = "used" if self.status == 1 else "unused"
+        return f"id={self.id} name={self.name!r} {used}"
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class RouteBookList:
+    """List of electronic route books (route_book service)."""
+
+    entries: tuple[RouteBookEntry, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"entries": [r.to_dict() for r in self.entries]}
+
+    def format(self) -> str:
+        if not self.entries:
+            return "no route books on device"
+        return "\n".join(r.format() for r in self.entries)
+
+
+async def _r_firmware(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    _args: Sequence[str],
+    timeout: float,
+) -> FirmwareInfo:
+    request = firmware_pb2.firmware_msg()
+    request.firmware_operate_type = firmware_pb2.enum_FIRMWARE_OPERATE_TYPE_GET_VERSION
+    response = await client.request(request, timeout=timeout)
+    msg = response.message
+    if not isinstance(msg, firmware_pb2.firmware_msg):
+        raise CommandError(f"unexpected response message: {type(msg).__name__}")
+    f = msg.firmware_data_msg
+    return FirmwareInfo(
+        mcu_firmware_ver=f.mcu_firmware_ver,
+        ble_firmware_ver=f.ble_firmware_ver,
+        ble_boot_firmware_ver=f.ble_boot_firmware_ver,
+    )
+
+
+async def _r_wifi(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    _args: Sequence[str],
+    timeout: float,
+) -> WifiStatus:
+    request = wifi_pb2.wifi_msg()
+    request.wifi_operate_type = wifi_pb2.enum_WIFI_OPERATE_TYPE_STATUS_GET
+    response = await client.request(request, timeout=timeout)
+    msg = response.message
+    if not isinstance(msg, wifi_pb2.wifi_msg):
+        raise CommandError(f"unexpected response message: {type(msg).__name__}")
+    # The device replies with a wifi_data_message; the first entry holds
+    # the connection state. status: 1=off, 2=on.
+    if not msg.wifi_data_msg:
+        return WifiStatus(on=False, ssid="", signal_strength=0)
+    d = msg.wifi_data_msg[0]
+    return WifiStatus(on=d.status == 2, ssid=d.ssid, signal_strength=d.signal_strength)
+
+
+async def _r_routes(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    _args: Sequence[str],
+    timeout: float,
+) -> RouteList:
+    request = route_plan_pb2.route_plan_data_msg()
+    request.route_plan_operate_type = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_LIST_GET
+    response = await client.request(request, timeout=timeout)
+    msg = response.message
+    if not isinstance(msg, route_plan_pb2.route_plan_data_msg):
+        raise CommandError(f"unexpected response message: {type(msg).__name__}")
+    routes = tuple(
+        RoutePlan(
+            id=r.id,
+            name=r.name,
+            file_type=r.file_type,
+            total_distance=r.total_distance,
+            status=r.status,
+        )
+        for r in msg.route_plan_info_msg
+    )
+    return RouteList(routes=routes)
+
+
+async def _r_route_books(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    _args: Sequence[str],
+    timeout: float,
+) -> RouteBookList:
+    request = route_book_pb2.route_book_data_msg()
+    # The route_book service has a two-level operate-type: top-level
+    # SERVICE_OPERATE_TYPE for GET/SET, plus a ROUTE_BOOK_SUB_OP_TYPE
+    # that distinguishes list-num / list-get / use / rename.
+    from .proto import common_pb2  # local to avoid widening the top imports.
+
+    request.operate_type = common_pb2.enum_SERVICE_OPERATE_TYPE_GET
+    request.sub_operate_type = route_book_pb2.enum_ROUTE_BOOK_GET_SUB_OP_TYPE_LIST_GET
+    response = await client.request(
+        request,
+        operation=common_pb2.enum_SERVICE_OPERATE_TYPE_GET,
+        timeout=timeout,
+    )
+    msg = response.message
+    if not isinstance(msg, route_book_pb2.route_book_data_msg):
+        raise CommandError(f"unexpected response message: {type(msg).__name__}")
+    entries = tuple(
+        RouteBookEntry(id=r.id, name=r.name, status=r.status) for r in msg.route_book_infor_msg
+    )
+    return RouteBookList(entries=entries)
+
+
 COMMANDS: Final[Mapping[str, CommandSpec]] = {
     "version": CommandSpec(
         name="version",
@@ -446,6 +645,26 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
         name="sensors",
         description="List paired sensors (HRM, cadence, power, radar, ...).",
         runner=_r_sensors,
+    ),
+    "firmware": CommandSpec(
+        name="firmware",
+        description="Read MCU/BLE firmware versions (via the FIRMWARE service).",
+        runner=_r_firmware,
+    ),
+    "wifi": CommandSpec(
+        name="wifi",
+        description="Read WiFi connection status (BSC200 hardware may not support WiFi).",
+        runner=_r_wifi,
+    ),
+    "routes": CommandSpec(
+        name="routes",
+        description="List route plans stored on the device.",
+        runner=_r_routes,
+    ),
+    "route-books": CommandSpec(
+        name="route-books",
+        description="List electronic route books stored on the device.",
+        runner=_r_route_books,
     ),
 }
 
