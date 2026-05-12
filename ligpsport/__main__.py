@@ -58,6 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.add_argument("--list", action="store_true", help="list available commands")
     cmd.add_argument("--json", action="store_true", help="emit result as JSON")
     cmd.add_argument(
+        "--backend",
+        choices=("bleak", "bluez"),
+        default="bleak",
+        help="BLE backend: 'bleak' (default, cross-platform) or 'bluez' "
+        "(Linux-only, BlueZ DBus with explicit MTU control)",
+    )
+    cmd.add_argument(
         "--timeout",
         type=float,
         default=10.0,
@@ -149,10 +156,19 @@ async def _cmd_command(args: argparse.Namespace) -> int:
     import asyncio as _asyncio
 
     from . import commands
-    from .ble import BleakTransport
     from .client import IgpsportClient
     from .credentials import CredentialStore
     from .proto import common_pb2, dev_status_pb2
+    from .transport import Transport
+
+    def _open_transport(address: str) -> Transport:
+        if args.backend == "bluez":
+            from .bluez import BluezTransport
+
+            return BluezTransport(address)
+        from .ble import BleakTransport
+
+        return BleakTransport(address)
 
     if args.list:
         for spec in commands.list_commands():
@@ -192,7 +208,7 @@ async def _cmd_command(args: argparse.Namespace) -> int:
         address = creds.address
 
     try:
-        async with BleakTransport(address) as transport, IgpsportClient(transport) as client:
+        async with _open_transport(address) as transport, IgpsportClient(transport) as client:
             if args.watch is not None and args.operation == "status":
                 # Stream DEV_STATUS notifications. The device sends them
                 # unsolicited while a ride is active; otherwise we poll

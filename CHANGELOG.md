@@ -7,6 +7,17 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- ``ligpsport.bluez.BluezTransport`` — a second BLE backend that
+  talks to BlueZ via DBus directly (using ``dbus-fast``). Bypasses
+  bleak's abstraction and uses ``AcquireWrite`` / ``AcquireNotify``
+  to obtain Unix file descriptors plus the *negotiated* ATT MTU.
+  On the BSC200 this raises the per-write payload from 23 bytes
+  (bleak's BlueZ default) to 247. Select via the CLI's
+  ``--backend bluez`` flag, or instantiate
+  ``ligpsport.bluez.BluezTransport`` directly. Linux-only.
+- ``docs/CAPTURE.md`` — Android HCI snoop log and Linux btmon
+  recipes for capturing BLE traffic, plus the Wireshark filters used
+  to extract the captured frame vectors in ``docs/PROTOCOL.md``.
 - ``ligpsport.routes`` — stdlib-only GPX and geoJSON parsing, plus a
   canonical GPX serialiser. Handles tracks, routes, and waypoints
   from GPX; handles bare LineString, MultiLineString, Feature, and

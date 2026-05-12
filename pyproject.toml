@@ -13,6 +13,7 @@ authors = [{ name = "ligpsport contributors" }]
 dependencies = [
     "bleak>=0.22",
     "protobuf>=4.25",
+    "dbus-fast>=2.0; sys_platform == 'linux'",
 ]
 
 [project.scripts]

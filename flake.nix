@@ -24,6 +24,11 @@
           dependencies = [
             python.pkgs.bleak
             python.pkgs.protobuf
+            # dbus-fast is the BlueZ-direct backend's only runtime
+            # dependency. It's also a transitive dep of bleak on Linux,
+            # so this only widens the wheel metadata, not the runtime
+            # closure.
+            python.pkgs.dbus-fast
           ];
           nativeBuildInputs = [ pkgs.ruff ];
           nativeCheckInputs = [
@@ -49,7 +54,13 @@
         mypyCheck = pkgs.runCommand "ligpsport-mypy"
           {
             nativeBuildInputs = [
-              (python.withPackages (ps: [ ps.mypy ps.bleak ps.protobuf ps.types-protobuf ]))
+              (python.withPackages (ps: [
+                ps.mypy
+                ps.bleak
+                ps.protobuf
+                ps.types-protobuf
+                ps.dbus-fast
+              ]))
             ];
             src = ./.;
           } ''
@@ -103,6 +114,7 @@
               ps.bleak
               ps.protobuf
               ps.types-protobuf
+              ps.dbus-fast
               ps.mypy
             ]))
             pkgs.ruff

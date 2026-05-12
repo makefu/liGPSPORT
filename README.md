@@ -26,7 +26,9 @@ spec).
 | Destructive commands (`delete-ride`, `delete-all-rides`) gated | yes |
 | File download (`get-ride`)                    | yes (simulator-verified) |
 | Real-time status streaming (`status --watch`) | yes         |
-| Route / map / theme upload                    | not yet     |
+| GPX / geoJSON route parsing + GPX emission    | yes (stdlib only) |
+| BlueZ-direct backend with MTU negotiation     | yes (`--backend bluez`) |
+| Route / map / theme upload                    | not yet (wire format known; pending btsnoop capture) |
 | Firmware upgrade                              | not yet     |
 | Live tracking (REAL_TIME_TRACE)               | not yet     |
 
@@ -118,8 +120,33 @@ LIGPSPORT_DEVICE_ADDRESS=AA:BB:CC:DD:EE:FF \
   nix develop --command pytest -q -m bsc200
 ```
 
-See [`AGENTS.md`](AGENTS.md) for contributor conventions and
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the wire spec.
+See [`AGENTS.md`](AGENTS.md) for contributor conventions,
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the wire spec, and
+[`docs/CAPTURE.md`](docs/CAPTURE.md) for the btsnoop / Wireshark
+recipes used to reverse-engineer it.
+
+## Backends
+
+The library ships two interchangeable transports:
+
+* **`bleak`** (default) — cross-platform (Linux / macOS / Windows);
+  the safe choice. On Linux it sits on top of BlueZ but doesn't
+  expose the negotiated MTU, which can hurt performance for large
+  uploads.
+* **`bluez`** (Linux-only) — talks to BlueZ via DBus directly using
+  `AcquireWrite` / `AcquireNotify`. Returns the *negotiated* ATT MTU
+  (247 bytes on the BSC200 instead of the 23-byte default) and uses
+  per-FD socket I/O so each `os.write` becomes exactly one ATT
+  Write Command of up to MTU size.
+
+Select via the CLI flag:
+
+```sh
+nix run . -- command --name bike --backend bluez version
+```
+
+Both backends satisfy the same `ligpsport.transport.Transport` ABC;
+all commands work with either one.
 
 ## License
 
