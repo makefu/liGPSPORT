@@ -19,10 +19,12 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Final
 
 from . import client as _client
+from . import file_transfer
 from .proto import (
     cycling_data_pb2,
     dev_status_pb2,
     dev_ver_info_pb2,
+    factory_pb2,
     firmware_pb2,
     route_book_pb2,
     route_plan_pb2,
@@ -37,9 +39,19 @@ from .proto import (
 # any of these must declare destructive=True so we have two layers of
 # defence (the runtime gate and this prefix-check).
 DESTRUCTIVE_PREFIXES: Final[tuple[tuple[int, int], ...]] = (
-    # (service, operation) tuples. Populated in later phases as the
-    # destructive command surface lands. Empty for now since the
-    # read-only commands below carry no risk.
+    # CYCLING_DATA delete operations: FILE_DEL=5, ALL_DEL=6.
+    (6, 5),
+    (6, 6),
+    # ROUTE_PLAN file delete & multi-file delete.
+    (7, 3),
+    (7, 6),
+    # FIRMWARE upgrade flows (MCU=3, BLE=5).
+    (4, 3),
+    (4, 5),
+    # FACTORY SN_SET (3) and SIM_FIT_SET (7) — both mutate persistent
+    # state in a way the user wouldn't want triggered accidentally.
+    (11, 3),
+    (11, 7),
 )
 
 
@@ -592,6 +604,178 @@ async def _r_routes(
     return RouteList(routes=routes)
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class DownloadedFile:
+    """The contents of a file pulled off the device."""
+
+    path: str
+    size_bytes: int
+    fit_magic: bool  # True iff the first 12 bytes match the FIT magic header.
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        magic = "FIT header verified" if self.fit_magic else "(not a recognised FIT file)"
+        return f"wrote {self.size_bytes} bytes -> {self.path}  {magic}"
+
+
+async def _r_set_rtc(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    args: Sequence[str],
+    timeout: float,
+) -> str:
+    """Set the device's real-time clock.
+
+    Without arguments uses the current UTC time. Optionally accepts a
+    unix epoch seconds value as the first argument.
+    """
+    import time as _time
+
+    epoch_s: int
+    if args:
+        try:
+            epoch_s = int(args[0])
+        except ValueError as exc:
+            raise CommandError(f"invalid epoch seconds: {args[0]!r}") from exc
+    else:
+        epoch_s = int(_time.time())
+
+    request = factory_pb2.factory_msg()
+    request.factory_operate_type = factory_pb2.enum_FACTORY_OPERATE_TYPE_RTC_SET
+    request.rtc_msg.time = epoch_s
+    await client.request(
+        request,
+        operation=factory_pb2.enum_FACTORY_OPERATE_TYPE_RTC_SET,
+        timeout=timeout,
+    )
+    return f"sent RTC = {epoch_s} (epoch seconds)"
+
+
+async def _r_set_user(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    args: Sequence[str],
+    timeout: float,
+) -> str:
+    """Set the user profile (weight, age, height, etc.)
+
+    Arguments are ``key=value`` pairs. Recognised keys: ``sex`` (0 or 1),
+    ``weight_kg`` (float), ``age`` (int), ``height_cm`` (int),
+    ``wheel_dia_mm`` (int), ``bike_weight_kg`` (float),
+    ``time_zone_h`` (float), ``member_id`` (string).
+    """
+    parsed: dict[str, str] = {}
+    for arg in args:
+        if "=" not in arg:
+            raise CommandError(f"expected key=value, got {arg!r}")
+        k, _, v = arg.partition("=")
+        parsed[k] = v
+
+    request = user_config_pb2.user_config_msg()
+    request.user_config_operate_type = user_config_pb2.enum_USER_CONFIG_OPERATE_TYPE_SET
+    u = request.user_config_data_message
+    if "sex" in parsed:
+        u.sex = int(parsed["sex"])
+    if "weight_kg" in parsed:
+        u.weight = int(float(parsed["weight_kg"]) * 10)
+    if "age" in parsed:
+        u.age = int(parsed["age"])
+    if "height_cm" in parsed:
+        u.height = int(parsed["height_cm"])
+    if "wheel_dia_mm" in parsed:
+        u.wheel_dia = int(parsed["wheel_dia_mm"])
+    if "bike_weight_kg" in parsed:
+        u.bike_weight = int(float(parsed["bike_weight_kg"]) * 10)
+    if "time_zone_h" in parsed:
+        u.time_zone = int(float(parsed["time_zone_h"]) * 3600)
+    if "member_id" in parsed:
+        u.member_id = parsed["member_id"]
+    await client.request(
+        request,
+        operation=user_config_pb2.enum_USER_CONFIG_OPERATE_TYPE_SET,
+        timeout=timeout,
+    )
+    return f"updated user profile ({len(parsed)} field{'s' if len(parsed) != 1 else ''})"
+
+
+async def _r_delete_ride(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    args: Sequence[str],
+    timeout: float,
+) -> str:
+    """Delete one recorded ride file from the device. **Destructive.**"""
+    if not args:
+        raise CommandError("delete-ride takes <timestamp>")
+    try:
+        timestamp = int(args[0])
+    except ValueError as exc:
+        raise CommandError(f"invalid timestamp: {args[0]!r}") from exc
+    request = cycling_data_pb2.cycling_data_msg()
+    request.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_DEL
+    f = request.cycling_data_file_flag_msg.add()
+    f.timestamp = timestamp
+    await client.request(
+        request,
+        operation=cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_DEL,
+        timeout=timeout,
+    )
+    return f"requested delete of ride file timestamp={timestamp}"
+
+
+async def _r_delete_all_rides(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    _args: Sequence[str],
+    timeout: float,
+) -> str:
+    """Delete every recorded ride on the device. **Very destructive.**"""
+    request = cycling_data_pb2.cycling_data_msg()
+    request.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_ALL_DEL
+    await client.request(
+        request,
+        operation=cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_ALL_DEL,
+        timeout=timeout,
+    )
+    return "requested delete-all-rides"
+
+
+async def _r_get_ride(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    args: Sequence[str],
+    timeout: float,
+) -> DownloadedFile:
+    if len(args) < 2:
+        raise CommandError("get-ride takes <timestamp> <out-path>")
+    try:
+        timestamp = int(args[0])
+    except ValueError as exc:
+        raise CommandError(f"invalid timestamp: {args[0]!r}") from exc
+    out_path = args[1]
+    expected_size: int | None = None
+    if len(args) >= 3:
+        try:
+            expected_size = int(args[2])
+        except ValueError as exc:
+            raise CommandError(f"invalid expected_size: {args[2]!r}") from exc
+    data = await file_transfer.download_cycling_data(
+        client,
+        timestamp=timestamp,
+        expected_size=expected_size,
+        chunk_timeout=timeout,
+        overall_timeout=max(60.0, timeout * 6),
+    )
+    with open(out_path, "wb") as fh:
+        fh.write(data)
+    # FIT files start with the local header pattern: byte 0 = header size
+    # (usually 12 or 14), bytes 8..11 = b".FIT".
+    fit_magic = len(data) >= 12 and data[8:12] == b".FIT"
+    return DownloadedFile(path=out_path, size_bytes=len(data), fit_magic=fit_magic)
+
+
 async def _r_route_books(
     _spec: CommandSpec,
     client: _client.IgpsportClient,
@@ -665,6 +849,35 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
         name="route-books",
         description="List electronic route books stored on the device.",
         runner=_r_route_books,
+    ),
+    "get-ride": CommandSpec(
+        name="get-ride",
+        description="Download a recorded ride file by timestamp: get-ride <ts> <out> [size]",
+        runner=_r_get_ride,
+    ),
+    "set-rtc": CommandSpec(
+        name="set-rtc",
+        description="Set the device clock (no args: now; or pass epoch seconds).",
+        runner=_r_set_rtc,
+    ),
+    "set-user": CommandSpec(
+        name="set-user",
+        description="Set user profile fields: set-user weight_kg=75 age=30 height_cm=180 ...",
+        runner=_r_set_user,
+    ),
+    "delete-ride": CommandSpec(
+        name="delete-ride",
+        description="Delete one ride file by timestamp.",
+        runner=_r_delete_ride,
+        destructive=True,
+        danger="Irreversibly deletes the ride file from the device's flash.",
+    ),
+    "delete-all-rides": CommandSpec(
+        name="delete-all-rides",
+        description="Delete every recorded ride file. Cannot be undone.",
+        runner=_r_delete_all_rides,
+        destructive=True,
+        danger="Erases all recorded ride history. No recovery once issued.",
     ),
 }
 

@@ -64,6 +64,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-request timeout (seconds); default 10",
     )
     cmd.add_argument(
+        "--watch",
+        type=float,
+        default=None,
+        metavar="SECS",
+        help="for status: stream live updates for this many seconds (default 30)",
+    )
+    cmd.add_argument(
         "--allow-destructive-commands",
         action="store_true",
         help="run commands that mutate persistent device state (see AGENTS.md §2)",
@@ -139,10 +146,13 @@ def _cmd_creds(args: argparse.Namespace) -> int:
 
 
 async def _cmd_command(args: argparse.Namespace) -> int:
+    import asyncio as _asyncio
+
     from . import commands
     from .ble import BleakTransport
     from .client import IgpsportClient
     from .credentials import CredentialStore
+    from .proto import common_pb2, dev_status_pb2
 
     if args.list:
         for spec in commands.list_commands():
@@ -153,6 +163,21 @@ async def _cmd_command(args: argparse.Namespace) -> int:
     if not args.operation:
         print("error: missing command name (try --list)", file=sys.stderr)
         return EXIT_USAGE
+
+    # Refuse destructive commands BEFORE opening the BLE link so we
+    # don't leak a connection just to print a refusal.
+    try:
+        spec = commands.get_command(args.operation)
+    except commands.UnknownCommandError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if spec.destructive and not args.allow_destructive_commands:
+        print(
+            f"error: command {args.operation!r} is destructive "
+            f"({spec.danger}); pass --allow-destructive-commands",
+            file=sys.stderr,
+        )
+        return EXIT_DESTRUCTIVE_BLOCKED
 
     address = args.address
     if address is None:
@@ -168,6 +193,26 @@ async def _cmd_command(args: argparse.Namespace) -> int:
 
     try:
         async with BleakTransport(address) as transport, IgpsportClient(transport) as client:
+            if args.watch is not None and args.operation == "status":
+                # Stream DEV_STATUS notifications. The device sends them
+                # unsolicited while a ride is active; otherwise we poll
+                # explicitly every second.
+                deadline = _asyncio.get_running_loop().time() + (args.watch or 30.0)
+                while _asyncio.get_running_loop().time() < deadline:
+                    result = await commands.run_named(
+                        client,
+                        args.operation,
+                        args.args,
+                        timeout=args.timeout,
+                    )
+                    if args.json:
+                        print(json.dumps(result.to_dict()))
+                    else:
+                        print(result.format())
+                        print("---")
+                    await _asyncio.sleep(1.0)
+                return EXIT_OK
+
             result = await commands.run_named(
                 client,
                 args.operation,
@@ -178,10 +223,9 @@ async def _cmd_command(args: argparse.Namespace) -> int:
     except commands.DestructiveCommandError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_DESTRUCTIVE_BLOCKED
-    except commands.UnknownCommandError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_USAGE
 
+    _ = common_pb2  # silence imports when --watch is not used
+    _ = dev_status_pb2
     if args.json:
         print(json.dumps(result.to_dict(), indent=2))
     else:
