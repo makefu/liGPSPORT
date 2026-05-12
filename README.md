@@ -1,4 +1,4 @@
-# ligpsport
+# libre iGPSSPORT
 
 Python BLE library and CLI for **iGPSPORT** cycling computers,
 verified end-to-end against an **iGPSPORT BSC200**. Other models in
