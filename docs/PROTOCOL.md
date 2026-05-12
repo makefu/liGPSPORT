@@ -331,22 +331,41 @@ incrementing `file_tag` (offset 3) per chunk.
 3. App accumulates ``file_content`` bytes until the cumulative size
    matches the ``file_size`` reported by the preceding LIST_GET.
 
-**Upload** (e.g. route plan):
+**Upload** (e.g. route plan): the upload path is **not** a normal
+``PbFrame``. Reverse-engineered from
+``IGPDeviceManager.sendRoutePlanFileSingleChannel`` in the app, a
+route upload blob is:
 
-1. Optionally: app sends ``general_file_operation`` SET with type,
-   size, id and md5 to announce the upload. (Used by newer firmware;
-   on the BSC200 the per-service ``FILE_SEND`` works on its own.)
-2. App chunks the source bytes into MTU-sized pieces and sends each
-   as a ``route_plan_data_msg`` (or equivalent) with
-   ``FILE_SEND=4``.
-3. Device replies with a ConfirmFrame (type=0x02) per chunk; final
-   chunk's ConfirmFrame carries a non-zero status if the upload
-   was rejected.
+```
+[20-byte header: service=FILE_OPERATION(21), op=SERVICE_OPERATE_TYPE_ADD(3), payload_size=0]
+[4 bytes big-endian = length of the general_file_operation pb]
+[general_file_operation pb bytes]
+[raw file content bytes]
+```
+
+The ``general_file_operation`` payload carries ``file_type=ROUTE_PLAN``,
+``file_id``, ``file_extension`` (the app hardcodes ``"cnx"`` but the
+device's parser also accepts ``"gpx"``), ``file_name``, and
+``file_size``. The header's payload-size field stays 0 — the device
+dispatches on the ``(service=21, op=ADD)`` tuple and switches to a
+file-receive state machine instead of using the standard reassembly
+path.
 
 The library's :mod:`ligpsport.file_transfer` exposes
-:func:`download_cycling_data` for the read direction. Upload is wired
-into the route_plan / route_book service handlers but isn't yet
-verified against the live BSC200.
+:func:`upload_route_plan` that builds this blob from any
+:class:`RouteData` (parsed from GPX or geoJSON). On the BSC200 the
+upload protocol is sensitive to MTU and flow control: with BlueZ's
+default 23-byte ATT MTU and 1300+ sequential writes, the device
+appears to drop the bytes and the upload silently fails. Resolving
+this likely needs an MTU negotiation to ~244 bytes (via the
+``ConfigureMTUOperation`` the iGPSPORT Android app issues before
+each upload) or a btsnoop capture of a working app upload to
+identify the exact sequencing.
+
+The library's :mod:`ligpsport.file_transfer` exposes
+:func:`download_cycling_data` for the read direction (verified
+against the in-tree simulator; the BSC200 has no recorded rides on
+hand to verify against the live device).
 
 ## 8. Destructive operations
 

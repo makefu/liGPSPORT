@@ -742,6 +742,74 @@ async def _r_delete_all_rides(
     return "requested delete-all-rides"
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class UploadedRoute:
+    """Result of an ``upload-route`` invocation."""
+
+    source: str
+    name: str
+    points: int
+    distance_m: int
+    file_id: int
+    status: int  # 0 = success per the device's ConfirmFrame.
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        result = "ok" if self.status == 0 else f"error (status={self.status})"
+        return (
+            f"uploaded {self.source}\n"
+            f"  name:      {self.name}\n"
+            f"  points:    {self.points}\n"
+            f"  distance:  {self.distance_m / 1000:.2f} km\n"
+            f"  file id:   {self.file_id}\n"
+            f"  status:    {result}"
+        )
+
+
+async def _r_upload_route(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    args: Sequence[str],
+    timeout: float,
+) -> UploadedRoute:
+    """Convert a GPX or geoJSON file to GPX and push it to the device."""
+    from . import routes as _routes
+
+    if not args:
+        raise CommandError("upload-route takes <path> [file_id]")
+    path = args[0]
+    file_id = 1
+    if len(args) >= 2:
+        try:
+            file_id = int(args[1])
+        except ValueError as exc:
+            raise CommandError(f"invalid file_id: {args[1]!r}") from exc
+
+    try:
+        route = _routes.load_route(path)
+    except _routes.RouteParseError as exc:
+        raise CommandError(str(exc)) from exc
+    if not route.points:
+        raise CommandError(f"{path!r} contains no usable points")
+
+    status = await file_transfer.upload_route_plan(
+        client,
+        route,
+        file_id=file_id,
+        timeout=max(30.0, timeout),
+    )
+    return UploadedRoute(
+        source=path,
+        name=route.name,
+        points=len(route.points),
+        distance_m=route.distance_m,
+        file_id=file_id,
+        status=status,
+    )
+
+
 async def _r_get_ride(
     _spec: CommandSpec,
     client: _client.IgpsportClient,
@@ -854,6 +922,11 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
         name="get-ride",
         description="Download a recorded ride file by timestamp: get-ride <ts> <out> [size]",
         runner=_r_get_ride,
+    ),
+    "upload-route": CommandSpec(
+        name="upload-route",
+        description="Upload a GPX or geoJSON route file: upload-route <path> [file_id]",
+        runner=_r_upload_route,
     ),
     "set-rtc": CommandSpec(
         name="set-rtc",
