@@ -216,29 +216,159 @@ accordingly.
 
 ## 6. Per-service operations
 
-**TBD** — populated phase-by-phase as the corresponding read/write
-paths land. Each section will document:
+This section covers the operations the library implements today. Every
+service follows the same wire shape:
 
-* the exact protobuf request/response message,
-* a captured hex example (header + payload) from the BSC200,
-* the dataclass the library exposes,
-* whether the operation is destructive (cf. §8).
+1. App builds the per-service protobuf request, sets the operate-type
+   to the desired value (typically ``GET=2`` or ``SET=1``).
+2. App writes the resulting PbFrame (20-byte header + serialised
+   protobuf) to the Control RX characteristic.
+3. Device replies with a PbFrame on the Data TX characteristic whose
+   ``operate_type`` is set to the matching response value (typically
+   ``SEND=3``).
+4. The header's ``service`` and ``operation`` bytes mirror the
+   protobuf ``service_type`` and ``operate_type`` (the
+   ``DeviceVersionInfoServiceFactory.getMessage`` Kotlin source sets
+   both to the same value).
+
+### 6.1 DEV_VER_INFO (service 17)
+
+* **Operation `GET=2`** — request the version block.
+* **Response `SEND=3`** — `version_msg` populated with
+  `ble_boot_ver`, `ble_app_ver`, `hardware_ver`, `protocol_ver`,
+  `compile_time`. The BSC200 omits `main_boot_ver` / `main_app_ver`.
+
+### 6.2 DEV_STATUS (service 13)
+
+* **`GET=1`** → **`SEND=2`** with cycling status, GPS coords, and
+  real-time data (speed, cadence, HR, power, altitude, slope,
+  course).
+
+### 6.3 USER_CONFIG (service 9)
+
+* **`GET=2`** → response carries the user profile (sex, weight,
+  age, height, wheel diameter, bike weight, time zone, member id).
+* **`SET=1`** with `user_config_data_message` overwrites the profile.
+
+### 6.4 CYCLING_DATA (service 6)
+
+* **`LIST_GET=1`** → **`LIST_SEND=2`** with one
+  `cycling_data_file_flag_message` per recorded ride
+  (`timestamp`, `file_size`, `user_id`, `device_id`).
+* **`FILE_GET=3`** identifying the file by timestamp → device streams
+  one or more **`FILE_SEND=4`** chunks whose `file_content` field
+  contains the FIT bytes. Each chunk uses an incrementing `file_tag`
+  byte in the 20-byte header (see §2.1).
+* **`FILE_DEL=5`** with a `cycling_data_file_flag_message` — destructive.
+* **`ALL_DEL=6`** — wipes all recorded rides — destructive.
+
+### 6.5 SENSOR (service 14)
+
+* **`GET=1`** → **`SEND=5`** with a `sensor_data_message` per
+  paired sensor (HRM / cadence / power / radar / light / ...).
+
+### 6.6 FIRMWARE (service 4)
+
+* **`GET_VERSION=1`** → **`SEND_VERSION=2`** with
+  `firmware_data_message` (MCU/BLE/BLE-boot versions).
+* **`MCU_UPDATE=3`** / **`BLE_UPDATE=5`** — destructive, gated.
+
+### 6.7 ROUTE_PLAN (service 7)
+
+* **`LIST_GET=1`** → **`LIST_SEND=2`** with
+  `route_plan_info_message` entries (id, name, file_type, total
+  distance, status).
+* **`FILE_SEND=4`** uploads a route file. The chunking pattern
+  mirrors CYCLING_DATA.
+* **`FILE_DEL=3`** / **`FILES_DEL=6`** — destructive.
+
+### 6.8 ROUTE_BOOK (service 23)
+
+* **`GET=2` + `LIST_GET=0x02`** — note the two-level operate-type:
+  the top-level `SERVICE_OPERATE_TYPE` plus a service-specific
+  `ROUTE_BOOK_SUB_OP_TYPE`. The BSC200 firmware in scope here may
+  not implement this service (the request times out).
+
+### 6.9 FACTORY (service 11)
+
+* **`SN_GET=1`** / **`SN_SEND=2`** — read the device serial number.
+* **`MEMORY_GET=5`** / **`BATTARY_GET=6`** — query flash + battery state.
+* **`RTC_SET=12`** — set the device clock (epoch seconds). Treated as
+  a write but not destructive (no data loss).
+* **`SN_SET=3`** and **`SIM_FIT_SET=7`** — destructive, gated.
+
+### 6.10 BLE (service 10)
+
+* **`BOND_REQ=2`** with a `ble_data_message` carrying the app's
+  `member_id` claims a binding key on the device.
+* **`BOND_INFO=1`** / **`UNBOND=4`** / **`CONNECT_STATUS=3`** —
+  binding lifecycle messages.
+
+### 6.11 WIFI (service 5)
+
+* **`STATUS_GET=1`** / **`STATUS_SEND=2`** — connection state. The
+  BSC200 doesn't expose a working WiFi service (requests time out);
+  the protocol is wired in for other iGS models that include WiFi.
+* **`CTRL=3`** / **`ASSIGN_SSID=6`** — destructive in the sense that
+  they overwrite the device's WiFi credentials.
 
 ## 7. File transfer
 
-**TBD** — `general_file_operation.proto` envelope, plus per-file-type
-streams for `cycling_data` (FIT rides), `route_plan`, `route_book`,
-`map_new`, `theme`, `firmware`, `language_pack`. Documented once the
-chunked download/upload loop is implemented and verified against the
-real device.
+File transfers are layered on the per-service envelope (cf. §6.4 for
+the canonical example: CYCLING_DATA). Each chunk is a PbFrame whose
+protobuf payload is the service's container message with the chunk
+bytes in its `file_content` field. The 20-byte header carries an
+incrementing `file_tag` (offset 3) per chunk.
+
+**Download** (e.g. ride file):
+
+1. App sends ``cycling_data_msg`` with ``FILE_GET=3`` and a
+   ``cycling_data_file_flag_message`` identifying the file.
+2. Device streams 1..N ``cycling_data_msg`` frames with
+   ``FILE_SEND=4`` and the chunk in ``file_content``. The first
+   chunk is the reply to the GET; subsequent chunks arrive
+   unsolicited on the same service.
+3. App accumulates ``file_content`` bytes until the cumulative size
+   matches the ``file_size`` reported by the preceding LIST_GET.
+
+**Upload** (e.g. route plan):
+
+1. Optionally: app sends ``general_file_operation`` SET with type,
+   size, id and md5 to announce the upload. (Used by newer firmware;
+   on the BSC200 the per-service ``FILE_SEND`` works on its own.)
+2. App chunks the source bytes into MTU-sized pieces and sends each
+   as a ``route_plan_data_msg`` (or equivalent) with
+   ``FILE_SEND=4``.
+3. Device replies with a ConfirmFrame (type=0x02) per chunk; final
+   chunk's ConfirmFrame carries a non-zero status if the upload
+   was rejected.
+
+The library's :mod:`ligpsport.file_transfer` exposes
+:func:`download_cycling_data` for the read direction. Upload is wired
+into the route_plan / route_book service handlers but isn't yet
+verified against the live BSC200.
 
 ## 8. Destructive operations
 
-The following service+operation combinations alter persistent state
-on the device. They are listed in `ligpsport.commands.DESTRUCTIVE_PREFIXES`
-and gated behind `--allow-destructive-commands`:
+The following ``(service, operation)`` tuples alter persistent state
+on the device. They are listed verbatim in
+``ligpsport.commands.DESTRUCTIVE_PREFIXES`` and gated behind
+``--allow-destructive-commands``:
 
-**TBD** — final list lands with Phase 8.
+| Service | Operation | Effect                                                |
+|---------|-----------|-------------------------------------------------------|
+| 6 (CYCLING_DATA) | 5 (FILE_DEL) | Permanently deletes one recorded ride file.   |
+| 6 (CYCLING_DATA) | 6 (ALL_DEL)  | Permanently deletes every recorded ride.       |
+| 7 (ROUTE_PLAN)   | 3 (FILE_DEL) | Deletes one route plan from the device.        |
+| 7 (ROUTE_PLAN)   | 6 (FILES_DEL)| Deletes multiple route plans in one shot.      |
+| 4 (FIRMWARE)     | 3 (MCU_UPDATE) | Initiates an MCU firmware flash.            |
+| 4 (FIRMWARE)     | 5 (BLE_UPDATE) | Initiates a BLE firmware flash.            |
+| 11 (FACTORY)     | 3 (SN_SET)   | Overwrites the device serial number.           |
+| 11 (FACTORY)     | 7 (SIM_FIT_SET) | Generates a fake ride file in flash.        |
+
+These are also refused by the simulator's
+``SimulatorState.allow_destructive`` guardrail unless explicitly
+opted in by test fixtures (cf. ``AGENTS.md`` §2).
 
 ## 9. Credential persistence
 
@@ -284,14 +414,27 @@ pair and persist it; subsequent connects reuse it.
 
 ## 11. Known unknowns
 
-* Whether the secondary UART channels are ever activated by the
-  BSC200 in practice. The app supports them for newer / higher-end
-  iGS models; the BSC200 may or may not advertise them. Capture
-  needed.
-* Whether the `wifi` service is functional on the BSC200 hardware
-  (the unit advertises `WIFI_MODULE` capability but the BSC200's
-  hardware doesn't appear to include WiFi). The library exposes the
-  service but the BSC200 capability list will gate it.
-* The exact rules for `Real-time Trace` streaming start/stop —
-  whether the device push starts on connection or only after an
-  explicit subscribe.
+* The BSC200 advertises all four UART services (`6e` / `7e` / `8e` /
+  `9e`) but only exchanges control protocol on `8e` (RX) ↔ `9e` (TX).
+  Whether the third/fourth channels (`7e`, `6e`) become active for
+  parallel firmware/file streams on this device's firmware is unknown
+  — capture needed during a firmware-upgrade flow.
+* The BSC200's `WIFI` (service 5), `ROUTE_BOOK` (service 23), and
+  `IND` (service 1, smart notifications) all time out on this firmware
+  (`May 14 2024 11:07:51`, `protocol_ver=101`). The library implements
+  them anyway because the app does — they're likely conditional on the
+  device's capability bits or simply absent on the BSC200 hardware.
+* Whether `REAL_TIME_TRACE` (service 8) streaming starts unsolicited
+  on connection or requires an explicit subscribe message. The
+  app's handling pulls from the same Control TX subscription either
+  way, so the library will pick it up once the trigger is observed.
+* The exact `general_file_operation` upload handshake order (does the
+  device's ConfirmFrame come after each chunk or only after the final
+  chunk?). The library currently sends all chunks and waits for one
+  ConfirmFrame — this works for short uploads but may need to slow
+  down for very large files.
+* MCU firmware version (`main_app_ver`, `main_boot_ver`) is missing
+  from this BSC200's `DEV_VER_INFO` reply. The `firmware` service
+  also returns `mcu_firmware_ver=0`. Whether the BSC200 truly has
+  no MCU firmware revision or simply doesn't expose it over BLE is
+  unknown.
