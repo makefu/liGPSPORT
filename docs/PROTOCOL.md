@@ -457,3 +457,210 @@ pair and persist it; subsequent connects reuse it.
   also returns `mcu_firmware_ver=0`. Whether the BSC200 truly has
   no MCU firmware revision or simply doesn't expose it over BLE is
   unknown.
+## 12. AGPS / ephemeris pre-seeding
+
+The BSC200 (and other iGS-series devices) accept an **AGPS / ephemeris
+seed** that drops the cold-start time-to-first-fix from ~30–90 s to
+~5–10 s. The payload is a u-blox **AssistNow Online** stream
+(concatenated UBX-MGA messages — ephemeris + almanac + reference
+time/position priors), valid for ~2–4 hours.
+
+This section documents the wire shape, the source, and the trade-off
+between the published `back.proto` schema (which describes the
+*intended* path) and the **actual** path the production iGPSPORT app
+takes (which is just `FILE_OPERATION` with a different `file_type`).
+
+### 12.1 Two paths, only one is real
+
+`reference/back.proto` defines an `ephemeris_data_message` that looks
+like the official upload format:
+
+```protobuf
+message ephemeris_data_message {
+  optional string    file_name = 1;   // e.g. "online_20240514.ubx"
+  optional bytes     contents  = 2;   // raw UBX-MGA stream
+  optional GPS_TYPE  gps_type  = 3;   // GPS / BD / GLONASS / GALILEO
+  optional AGPS_TYPE agps_type = 4;   // ONLINE / ANO_OFFLINE / ALM_OFFLINE
+  optional uint32    time      = 5;   // UTC
+}
+message back_msg {
+  service_type      = BACK (3);
+  back_service_type = EPHEMERIS (5);
+  back_operate_type = SEND (2);
+  optional ephemeris_data_message ephemeris_data_msg = 8;
+}
+```
+
+with the matching enums:
+
+| Enum                | Values                                                |
+|---------------------|-------------------------------------------------------|
+| `GPS_TYPE`          | INVALID(0), GPS(1), BD(2), GLONASS(3), GALILEO(4)     |
+| `AGPS_TYPE`         | INVALID(0), ONLINE(1), ANO_OFFLINE(2), ALM_OFFLINE(3) |
+| `BACK_SERVICE_TYPE` | NONE, MAIN, WEATHER, AIR_PRESSURE, ELEVATION, EPHEMERIS=5 |
+
+The proto comment on `file_name` even hedges: *"此命令后期可以作废，
+由码表自己根据类型等信息定义文件名"* ("this command can be deprecated
+later — the cycle computer will define the file name itself based on
+type info"). That hedge held: **the official app does NOT use
+`back_msg` / `ephemeris_data_msg` for the upload.** Instead it routes
+the upload through `FILE_OPERATION` (service 21), exactly like a CNX
+route, with only `file_type` differing.
+
+Cross-referenced from
+`IGPDeviceManager.writeEphemerisDataSingleChannel`
+(`classes4.dex` line ~6246) and
+`DeviceBleManagerHandler.sendAGPS` / `sendOfflineAGPS`
+(`classes5.dex` lines ~10127 / ~16335):
+
+| Field               | Value                                                 |
+|---------------------|-------------------------------------------------------|
+| header `service`    | 21 (`FILE_OPERATION`)                                 |
+| header `operation`  | 3 (`ADD`)                                             |
+| header `byte[3]`    | `0xAA` (the same upload magic as a CNX route)         |
+| pb `file_type`      | 7 (`FILE_TYPE_AGPS`)                                  |
+| pb `file_id`        | `GPS_TYPE` enum number (1=GPS, 2=BD, 3=GLO, 4=GAL)    |
+| pb `file_name`      | basename split on `.`, e.g. `"online_20240514"`       |
+| pb `file_extension` | `"ubx"`                                               |
+| pb `file_size`      | length of the contents                                |
+| body                | raw UBX-MGA stream                                    |
+| channel             | **Fourth** (`6e`) — same chunk transport as CNX upload|
+
+The device's `ConfirmFrame` on success has `status=0`. There is no
+multi-chunk handshake distinct from the regular CNX flow — the whole
+payload goes out as one logical frame, fragmented at the MTU.
+
+The lingering use of `back_msg` is for the **device-initiated GET
+notification** documented in §2.4 (the every-3-second "send me
+ephemeris" poll on the control channel). The app replies by triggering
+the `FILE_OPERATION` upload above. The `back_msg{operate=SEND}` shape
+is never sent on the wire by the production app.
+
+### 12.2 Source: u-blox AssistNow Online
+
+URL (from `DeviceBleManagerHandler.sendAGPS`, `classes5.dex` line 10213):
+
+```
+http://online-live1.services.u-blox.com/GetOnlineData.ashx
+    ?token=<TOKEN_SUFFIX>
+```
+
+where `<TOKEN_SUFFIX>` is the full string `token=<DEVELOPER_TOKEN>&<query…>`
+expects to receive. The iGPSPORT app does NOT hardcode the developer
+token in the APK; instead it fetches the entire token-suffix string at
+startup from its own backend:
+
+```
+GET https://prod.en.igpsport.com/service/mobile/api/Config/GetDefaultConfig?type=0
+
+→ {"code":0, "message":"", "data":"<token>&gnss=gps&datatype=eph"}
+```
+
+`prod.zh.igpsport.com` is the mainland-China sibling and serves the
+same payload. The value is then persisted to
+`<filesDir>/default_config.json` and surfaced via
+`UserIdentity.getDefaultConfig().getAgpsToken()`.
+
+The literal token observed at the time of this writing is
+`Ui8i31HZzkijSxQvrrRGJw` (verified 2026-05-14 against the live u-blox
+endpoint: HTTP 200, 2464 B of `application/ubx` named `mgaonline.ubx`,
+starting `B5 62 13 40` = MGA-INI-TIME_UTC). The token may rotate, so
+clones should fetch fresh — the iGPSport `Config/GetDefaultConfig`
+endpoint requires no authentication (no `Authorization` header, no
+user account).
+
+The trailing `&gnss=gps&datatype=eph` is also dictated by the iGPSport
+backend response — the official app appends it verbatim to the u-blox
+URL. The device firmware expects exactly *GPS ephemeris only* (not a
+multi-constellation payload).
+
+Typical response is ~2.5 KB and contains:
+* one `UBX-MGA-INI-TIME_UTC` (0x13 0x40) — reference time, valid at
+  fetch instant.
+* one `UBX-MGA-INI-POS_LLH` or `UBX-MGA-INI-POS_XYZ` (0x13 0x00) if
+  the backend can geo-IP the requester.
+* up to ~30 `UBX-MGA-EPH` messages — one per active GPS satellite,
+  each containing the 3-subframe broadcast ephemeris for the next
+  ~4 hours.
+
+For a self-hosted clone that wants to avoid the runtime dependency on
+iGPSport's backend, register at
+https://www.u-blox.com/en/assistnow-service-evaluation-token-request
+for a free developer token of your own.
+
+For **offline AGPS** (longer-term almanac data) the app instead hits
+`https://offline-live1.services.u-blox.com/GetOfflineData.ashx?token=…`
+with the URL itself returned by the iGPSPORT backend
+(`GetUrlByTypeUtil.getUrl(10)`, `classes5.dex` line 16462). The
+offline file is much larger (~150 KB) and valid for several days; the
+app uploads it with `AGPS_TYPE = ANO_OFFLINE` (and `file_id =
+GPS_TYPE_GPS = 1`). The wire shape is otherwise identical.
+
+### 12.3 File-name conventions
+
+Reverse-engineered from `DeviceBleManagerHandler.sendAGPS`
+(`classes5.dex` lines ~10266–10316):
+
+* **Online**: `online_<YYYY><MM><DD>.ubx`. The app derives the date
+  from the response body itself: `bytes[10]` (interpreted unsigned)
+  plus 1792 = year, `bytes[12]` = month, `bytes[13]` = day, zero-padded
+  to 2 digits. Simpler implementations can substitute today's UTC
+  date — the device stores `file_name` for display only; the *contents*
+  are what the firmware parses.
+* **Offline**: `offline_<YYYY><MM><DD>.ubx`, today's UTC date
+  (`yyyyMMdd` per `TimeUtils.date2String`).
+* **Almanac-only offline**: `offline_alm_<YYYY><MM><DD>.ubx`.
+
+The protobuf splits this on `.` into `file_name` and
+`file_extension="ubx"` per the regular `FILE_OPERATION` schema.
+
+### 12.4 Reference Kotlin implementation (`ligpsport-android`)
+
+* `agps/AgpsClient.kt` — ktor `HttpClient` wrapper that GETs the
+  online URL and returns the raw bytes. When no developer token is
+  passed it first calls iGPSport's `Config/GetDefaultConfig?type=0`
+  to recover one, exactly like the official app.
+* `ble/UploadPipeline.kt#seedAgps` — public entry: opens the paired
+  BLE transport, fetches AGPS, uploads via
+  `FileTransfer.uploadGeneralFile` with `fileType = FILE_OP_TYPE_AGPS (7)`.
+* `ble/UploadPipeline.kt#uploadAgpsBestEffort` — internal helper
+  piggybacked onto every `uploadGpx` call. If the network fetch fails
+  or the device rejects, it logs and returns `null` so the route
+  upload still proceeds. Success surfaces as `agps_bytes=<N>` in the
+  RESULT line.
+* `BuildConfig.AGPS_TOKEN` (sourced from `LIGPSPORT_AGPS_TOKEN` at
+  build time) is now optional — when blank, `AgpsClient` falls back
+  to iGPSport's backend. Use the override when you have your own
+  u-blox AssistNow developer token and want to avoid the runtime
+  dependency on `prod.en.igpsport.com`:
+  ```sh
+  LIGPSPORT_AGPS_TOKEN=YOUR_UBLOX_TOKEN nix run .#build-debug
+  ```
+
+### 12.5 Headless test harness
+
+The adb-driven e2e suite exposes a standalone broadcast:
+
+```sh
+adb shell am broadcast \
+  -n de.syntaxfehler.ligpsport.debug/de.syntaxfehler.ligpsport.cli.AdbCliReceiver \
+  -a de.syntaxfehler.ligpsport.action.SEND_AGPS \
+  --es req_id "$RANDOM"
+```
+
+emits
+
+```
+LigpsportAdb: RESULT action=SEND_AGPS req_id=… status=OK
+              name=BSC200 mac=… agps_bytes=3014 device_status=0
+```
+
+If `LIGPSPORT_AGPS_TOKEN` was unset at build time the broadcast
+returns `status=FAIL reason="no AGPS token — set LIGPSPORT_AGPS_TOKEN
+at build time (see docs/PROTOCOL.md §10)"`. The e2e runner treats
+this failure as non-fatal so CI doesn't depend on a u-blox token.
+
+`PLAN_AND_UPLOAD` and `UPLOAD` RESULT lines gain an `agps_bytes=<N>`
+field when the piggybacked seed succeeds. Absence of the field means
+the AGPS step was skipped — no token, no network, or device rejection.
+The route upload itself succeeds or fails independently.
