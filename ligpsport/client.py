@@ -156,17 +156,37 @@ class IgpsportClient:
         Frames that match a pending :meth:`request` go to that
         request's future instead; only the leftover unsolicited
         frames (e.g. periodic ``DEV_STATUS`` notifications) reach
-        subscribers.
+        subscribers. Prefer :meth:`open_subscription` when you need
+        the registration to take effect *before* you trigger the
+        peer to reply.
         """
-        queue: asyncio.Queue[Response] = asyncio.Queue()
-        async with self._lock:
-            self._subscribers.setdefault(service_type, []).append(queue)
+        queue = await self.open_subscription(service_type)
         try:
             while True:
                 yield await queue.get()
         finally:
-            async with self._lock:
-                self._subscribers.get(service_type, []).remove(queue)
+            await self.close_subscription(service_type, queue)
+
+    async def open_subscription(self, service_type: int) -> asyncio.Queue[Response]:
+        """Register a subscription queue **eagerly** and return it.
+
+        Unlike :meth:`subscribe`, the queue is hooked into the
+        dispatcher synchronously — there is no race between the
+        caller's first ``await`` and the arrival of a frame the
+        caller's about to trigger. Callers must pair this with
+        :meth:`close_subscription` to remove the queue when done.
+        """
+        queue: asyncio.Queue[Response] = asyncio.Queue()
+        async with self._lock:
+            self._subscribers.setdefault(service_type, []).append(queue)
+        return queue
+
+    async def close_subscription(self, service_type: int, queue: asyncio.Queue[Response]) -> None:
+        """Unregister a queue previously returned by :meth:`open_subscription`."""
+        async with self._lock:
+            subs = self._subscribers.get(service_type, [])
+            if queue in subs:
+                subs.remove(queue)
 
     async def _read_loop(self) -> None:
         try:

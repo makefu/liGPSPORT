@@ -1,0 +1,31 @@
+ligpsport — third-party attribution
+===================================
+
+Portions of this project incorporate or are derived from third-party
+software. Their licenses and notices follow.
+
+----------------------------------------------------------------------
+
+GPXtoCNXConverter
+  https://github.com/LudvvigB/GPXtoCNXConverter
+  Copyright (c) LudvvigB
+  Licensed under the Apache License, Version 2.0.
+
+The ``ligpsport.cnx`` module is derived from the GPXtoCNXConverter
+project's GPX-to-CNX serialiser. The conversion algorithm — the
+second-difference ``<Tracks>`` encoding, the distance / ascent /
+descent metric calculation, the ``<Route>`` XML layout including the
+self-closing ``<Navs />`` quirk and the UTF-8 BOM — was reverse-
+engineered there. We reimplemented it in pure stdlib (no fitparse,
+no Decimal-context inheritance) and wired it into the ligpsport BLE
+upload path, but the file format expertise belongs to the upstream
+author.
+
+A verbatim copy of the upstream Apache 2.0 license is preserved at
+``LICENSES/GPXtoCNXConverter-LICENSE``.
+
+The GUI ``POI Types Editor`` tool from the upstream project is not
+incorporated; only the GPX→CNX conversion logic is reused.
+
+ligpsport itself is MIT-licensed (see ``LICENSE``). The Apache 2.0
+terms apply only to the derivative work in ``ligpsport/cnx.py``.

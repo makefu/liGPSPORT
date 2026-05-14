@@ -123,6 +123,24 @@ tshark -r btsnoop_hci.log \
 Drop the trimmed file into ``tmp/captures/`` (gitignored) for the
 library to consume.
 
+### Anonymisation
+
+The capture committed at ``docs/btsnoop_hci.log`` was filtered and
+scrubbed before being published. The script lives at
+``tmp/anon_btsnoop.py`` (kept locally, not in git); it:
+
+* Keeps only HCI commands/events related to the BSC200 connection
+  handle (drops Classic-BT pairing noise and BLE advertising for
+  other devices).
+* Rewrites the BSC200's MAC ``F7:11:62:07:1F:F5`` → ``F7:11:CA:FE:BA:BE``
+  (the last four bytes spell ``CA:FE:BA:BE``).
+* Rewrites the captured central (phone) MAC and other side-channel
+  addresses to synthetic placeholders so no real device identifier
+  survives.
+
+The output is still a valid btsnoop v1 file; wireshark / tshark read
+it transparently. Regenerate when refreshing the capture.
+
 ---
 
 ## 2. Linux btmon

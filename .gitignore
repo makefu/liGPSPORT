@@ -14,4 +14,8 @@ __pycache__/
 /tmp/
 
 # Per-run scratch
-/.claude/outputs/
+/.claude/
+
+# Raw Android bugreport dumps (used to recover the snoop log; never
+# tracked — they're huge and contain a full device state snapshot).
+/bugreport*.zip

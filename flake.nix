@@ -17,7 +17,7 @@
         # standalone, outside that env, sidesteps the issue.
         package = python.pkgs.buildPythonPackage {
           pname = "ligpsport";
-          version = "0.1.0";
+          version = "1.0.0";
           src = ./.;
           pyproject = true;
           build-system = [ python.pkgs.setuptools ];
@@ -34,6 +34,9 @@
           nativeCheckInputs = [
             python.pkgs.pytestCheckHook
             python.pkgs.pytest-asyncio
+            # fitparse is read-only — used by tests to verify our FIT
+            # course encoder round-trips. Not a runtime dependency.
+            python.pkgs.fitparse
           ];
           enabledTestPaths = [ "tests" ];
           pytestFlags = [ "-q" ];
@@ -115,6 +118,7 @@
               ps.protobuf
               ps.types-protobuf
               ps.dbus-fast
+              ps.fitparse
               ps.mypy
             ]))
             pkgs.ruff

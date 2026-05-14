@@ -331,38 +331,330 @@ incrementing `file_tag` (offset 3) per chunk.
 3. App accumulates ``file_content`` bytes until the cumulative size
    matches the ``file_size`` reported by the preceding LIST_GET.
 
-**Upload** (e.g. route plan): the upload path is **not** a normal
-``PbFrame``. Reverse-engineered from
-``IGPDeviceManager.sendRoutePlanFileSingleChannel`` in the app, a
-route upload blob is:
+**Upload** (e.g. route plan): the route-upload path is **not** a
+normal PbFrame. It is a two-characteristic chunked stream with one
+ACK per chunk, derived from
+``IGPDeviceManager.sendRoutePlanFile`` (smali 24586-24996) and the
+chunk-send mechanic in `BaseCommand.run` (smali 1300-1330) plus
+``IGPDeviceManager.send`` / ``sendAfterRequestMtu`` / ``send$lambda-135``
+(smali 22547-22710 and 3419-3510).
 
-```
-[20-byte header: service=FILE_OPERATION(21), op=SERVICE_OPERATE_TYPE_ADD(3), payload_size=0]
-[4 bytes big-endian = length of the general_file_operation pb]
-[general_file_operation pb bytes]
-[raw file content bytes]
-```
+Per chunk the app does this:
 
-The ``general_file_operation`` payload carries ``file_type=ROUTE_PLAN``,
-``file_id``, ``file_extension`` (the app hardcodes ``"cnx"`` but the
-device's parser also accepts ``"gpx"``), ``file_name``, and
-``file_size``. The header's payload-size field stays 0 — the device
-dispatches on the ``(service=21, op=ADD)`` tuple and switches to a
-file-receive state machine instead of using the standard reassembly
-path.
+1. Build a `route_plan_data_msg` protobuf with
+   `service_type=ROUTE_PLAN(7)`,
+   `route_plan_operate_type=FILE_SEND(4)`,
+   one `route_plan_info_message` (`id`, `file_type`, `name`,
+   `total_distance`), `line_id=["<file_id>.<ext>"]`, and
+   `file_content=<chunk bytes>`. Serialise to **raw protobuf bytes**
+   — call this `sendData`. **No 20-byte header.**
+2. Build a 20-byte `confirmData` header
+   (`BaseFactory.confirmCommandByteArray`, smali 112-185)
+   parameterised for ROUTE_PLAN / FILE_SEND:
+
+   ```
+   off  width  field
+   0    1      0x01            (END_TYPE_PB literal)
+   1    1      0x07            (service = ROUTE_PLAN ordinal)
+   2    1      0xFF            (sub_service)
+   3    1      0xFF            (byte3 default)
+   4    1      0x04            (operation = FILE_SEND.getNumber())
+   5    1      0xFF            (sub_operation)
+   6    1      0xFF            (reserved)
+   7-8  2      BE u16 = len(sendData)
+   9    1      CRC8(sendData)
+   10   1      endType         (2 for not-last chunk, 3 for the last)
+   11-18 8     0xFF padding
+   19   1      CRC8(bytes 0..18)
+   ```
+
+3. Write `sendData` to the **data-bearing characteristic**:
+   - `…-6e` (Fourth UART RX) for generation-3+ devices
+     (BSC200, BSC300, iGS520, iGS320 family);
+   - `…-9e` (primary UART RX) for generation-1/2 devices.
+
+   The kernel/BlueZ splits this into ATT-MTU-sized writes
+   automatically; with the BlueZ-direct backend the negotiated MTU
+   is 247, so chunks of any size fit in ⌈n/244⌉ ATT writes.
+
+4. After the `sendData` write completes, write the 20-byte
+   `confirmData` to the **control characteristic** (`…-8e`) as a
+   single ≤20-byte ATT Write. The app does this only for
+   generation 2 or 3 devices; gen-1 / gen-4 paths differ and are
+   out of scope here (gen-4 uses `sendRoutePlanFileSingleChannel`,
+   not yet implemented).
+
+5. Wait for the device's ACK on **any TX channel** — it arrives as
+   a 20-byte frame (`framing.parse_frame` returns it unchanged)
+   carrying `service=ROUTE_PLAN(7)`,
+   `operation=FILE_SEND(4)`, and the **status byte at offset 7**
+   (`ConfirmCommand.<init>(byte[])`, smali 137-138). The status byte
+   is the `DeviceReturnStatus` ordinal (`com.igpsport.blelib.DeviceReturnStatus`):
+
+   |   | Code | Meaning                                           |
+   | - | ---- | ------------------------------------------------- |
+   |   | 0    | Success                                           |
+   |   | 1    | DataError (file content rejected by the parser)   |
+   |   | 2    | MemoryError                                       |
+   |   | 3    | LowBattery                                        |
+   |   | 4    | QuantityIsFull / DoneEarly (route limit reached)  |
+   |   | 5    | IsBeingUsed                                       |
+   |   | 6    | UnsupportedCommand                                |
+   |   | 14   | WifiCyclingActivityIsUploading                    |
+   |   | 15   | NavigationRouteDeletionFailed                     |
+   |   | 16   | NavigationRouteDoesNotExist                       |
+
+   The receive handler treats status 0 + `isLastPack` as upload
+   complete and status 4 as "device drained the queue, stop early".
+   Anything else surfaces as :class:`RouteUploadError`.
+
+6. After all chunks are ACKed, send a single ``FILE_USE`` command
+   (mirrors `setRoutePlanFile`, smali 27391-27430). The protobuf
+   has `operate_type=FILE_USE(5)`, the same `line_id` and `info_msg`
+   as the chunks but **no `file_content`**, and is wrapped in a
+   standard 20-byte PbFrame header (byte 10 = 0x01, the normal
+   END_TYPE_PB literal). The header goes on the **control**
+   characteristic just like the chunked trailers. The device acks
+   with another `(service=ROUTE_PLAN, operation=FILE_USE)` confirm
+   frame. ``status=0`` means the device has switched its navigation
+   pointer to the new route file.
+
+The filename in the protobuf metadata is clipped per-device. Source:
+the `String.hashCode()` switch in `sendRoutePlanFile` smali
+24648-24705:
+
+| Device                                | UTF-8 byte limit |
+| ------------------------------------- | ----------------:|
+| BSC200, BSC300, iGS320 (all variants), iGS630 | 60       |
+| iGS520                                | 50               |
+| iGS620                                | 28               |
+| (fallback for unknown devices)        | 40               |
+
+After truncating to the byte limit the app decodes with
+`errors="replace"` and strips replacement chars so the result lands
+on a complete codepoint.
 
 The library's :mod:`ligpsport.file_transfer` exposes
-:func:`upload_route_plan` that builds this blob from any
-:class:`RouteData` (parsed from GPX or geoJSON). On the BSC200 the
-upload protocol is sensitive to MTU and flow control: with BlueZ's
-default 23-byte ATT MTU and 1300+ sequential writes, the device
-appears to drop the bytes and the upload silently fails. Resolving
-this likely needs an MTU negotiation to ~244 bytes (via the
-``ConfigureMTUOperation`` the iGPSPORT Android app issues before
-each upload) or a btsnoop capture of a working app upload to
-identify the exact sequencing.
+:func:`upload_route_plan` that drives this chunked exchange from any
+:class:`RouteData` (parsed from GPX or geoJSON). The `--backend
+bluez` flag in the CLI is recommended for live uploads — bleak's
+default 23-byte MTU forces ~1300 ATT writes for a typical route
+where the BlueZ backend uses ~110 at MTU 247.
 
-The library's :mod:`ligpsport.file_transfer` exposes
+### 7.1 File-format requirement: CNX is mandatory on the BSC200
+
+The wire protocol above accepts any of the
+``ROUTE_PLAN_FILE_TYPE`` enum values (CNX/GPX/FIT/TCX/XML), but the
+**BSC200 firmware (BLE app v141, MCU compile date 2024-05-14)
+rejects everything except CNX** with persistent ``status=1``
+(DataError) on every chunk. The route never lands. Variants
+tested:
+
+* ``<trk>``-form GPX with ``file_type=GPX`` — DataError on
+  chunk 0.
+* ``<rte>``-form GPX with ``file_type=GPX`` — DataError on
+  chunk 0.
+* GPX bytes with ``file_type=CNX`` (mislabelled) — DataError on
+  chunk 0. The device parses the first chunk against a
+  CNX-shape expectation; lying about the enum doesn't help.
+* Synthesised FIT Course file (proto 2.0, file_id.type=Course,
+  course + lap + event start/stop + record stream) with
+  ``file_type=FIT`` — DataError on chunk 0. ``ligpsport.fit_course``
+  passes ``fitparse`` round-trip, so the FIT is structurally
+  valid; the BSC200 firmware simply doesn't accept it.
+
+The rejection matches the reference app exactly: **every** call
+to ``IGPDeviceManager.sendRoutePlanFile`` in the Android APK
+hardcodes ``file_extension="cnx"``. The three call sites are:
+
+| Class | dex | smali line | first-arg literal |
+|-------|-----|------------|-------------------|
+| `RoadBookSearchActivity` | c4 | 1548 | `const-string v19, "cnx"` |
+| `RoadBookAndSegmentActivity` | c4 | 1652 | `const-string v19, "cnx"` |
+| `PlanningRouteDetailActivity` | c5 | 3073 | `const-string v19, "cnx"` |
+
+Exhaustively verified — a binary grep across **all seven**
+``classes*.dex`` files of the APK shows zero occurrences of
+``sendRoutePlanFile`` or ``IGPDeviceManager`` outside c4 and c5,
+and the only other ``"gpx"`` literals (in c4/c5) are UI/file-
+picker MIME filters and icon names (e.g. ``ic_gpx_file``,
+``not_support_non_gpx``). The user's GPX file never reaches
+``sendRoutePlanFile`` as GPX bytes — it goes through OSS
+upload + server-side conversion first.
+
+CNX is iGPSPORT's proprietary binary format. The reference Android
+app never converts GPX to CNX client-side — when a user picks a
+``.gpx`` file via the system file picker, the app
+(``RoadBookAndSegmentViewModel.uploadRouteFile``, smali 1929-2017)
+uploads the bytes to an Aliyun OSS bucket via
+``OssUtil.uploadFile2``. The iGPSPORT cloud generates the CNX
+file server-side; the app then fetches the CNX bytes from
+``GET /service/mobile/api/Routes/DownloadRoutes`` and sends those
+to the BSC200 with ``file_extension="cnx"``. There is no
+client-side converter to reverse-engineer.
+
+#### 7.1.1 Two dead ends: GPXtoCNXConverter and bbmodel.Route
+
+We tried two independent local-conversion paths against the live
+device (firmware *2024-05-14*, file_id=99) via the ROUTE_PLAN /
+FILE_SEND service:
+
+1. **GPXtoCNXConverter** (LudvvigB, Apache 2.0) — XML with
+   second-difference ``<Tracks>`` encoding, ``Encode=2``, decimal
+   ``<Distance>`` / ``<Ascent>`` / ``<Descent>`` strings, BOM.
+   Rejected with status=1 (DataError) on chunk 0/2.
+2. **bbmodel.Route** XML — Jackson bean at
+   ``com/igpsport/globalapp/devicemodule/bean/bbmodel/Route.smali``,
+   ``Reduce=0`` instead of ``Encode``, integer metrics, plain
+   doubles in Tracks, no delta encoding. Also rejected.
+
+Conclusion of §7.1.1: it isn't the CNX *content* — it's the
+service. Both shapes also failed when sent via ROUTE_PLAN
+FILE_SEND, which turns out to be the *wrong* upload path for
+BSC200 entirely. See §7.1.2.
+
+#### 7.1.2 The actual upload path: FILE_OPERATION ADD
+
+A btsnoop capture (Android app → BSC200, route id 3130362; the
+anonymised capture lives at ``docs/btsnoop_hci.log`` — MACs scrubbed
+per ``docs/CAPTURE.md`` §Anonymisation) showed the route upload goes
+via **service 21 (FILE_OPERATION) + operate_type 3 (ADD)**, *not*
+ROUTE_PLAN / FILE_SEND. The smali
+function ``IGPDeviceManager.sendRoutePlanFileSingleChannel``
+(c4 line 3753-3964) handles it; the global APK only calls this
+path when ``IGPDevice.getGeneration() == 4`` (i.e. iGS630), but
+the BSC200 nonetheless accepts it — either the generation check
+is outdated or the BSC200 is gen 4 in current firmware.
+
+Wire format, all writes to the **fourth** characteristic
+(``…-6e``), no per-chunk ACKs:
+
+```
+[20-byte head]
+  0  0x01           TYPE_PB
+  1  0x15           service = FILE_OPERATION
+  2  0xff           sub_service
+  3  0xaa           file_tag (magic for chunked file upload)
+  4  0x03           operation = ADD
+  5  0xff           sub_operation
+  6  0xff           reserved
+  7  0x00 0x00      size (8) = 0 (real size in the 4-byte prefix below)
+  9  0x00           payload CRC (empty payload → 0)
+  10 0x01           END_TYPE_PB
+  11..18 0xff       reserved
+  19 CRC8(0..18)    header CRC
+[4 bytes BE]        size of the general_file_operation protobuf
+[general_file_operation pb]
+  field 1 varint    service_type = 21
+  field 2 varint    operate_type = 3 (ADD)
+  field 3 varint    file_type    = 2 (ROUTE_PLAN)
+  field 4 varint    file_size    (length of the file body that follows)
+  field 5 varint    file_id      (any positive int; the cloud uses RouteId)
+  field 6 string    file_name    (UTF-8; truncated to device limit)
+  field 7 string    file_extension = "cnx"
+[file_size bytes]   the raw CNX body
+```
+
+The whole thing is split into MTU-3 byte writes (244 with the
+negotiated 247 MTU on BSC200; 20 with bleak's default 23) on the
+fourth characteristic. After the last write, the device sends a
+single notification on the FILE_OPERATION service with
+``status=0`` (Success) once it has parsed the route. No
+``FILE_USE``-style commit is needed — the route is live as soon
+as the device acks.
+
+CNX content shape (from the same capture) — single-line XML,
+ASCII (no BOM):
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<Route>
+  <Id>3130362</Id>
+  <Distance>8062.16</Distance>
+  <Duration></Duration>
+  <Ascent>181</Ascent>          ← integer metres, NOT 181.00
+  <Descent>-200</Descent>
+  <Encode>2</Encode>
+  <Lang>0</Lang>
+  <TracksCount>213</TracksCount>
+  <Tracks>48.7561529,9.2263629,55241;170,2171,0;...;</Tracks>
+  <Navs/>                       ← no space, no children
+  <Points/>                     ← empty when no POIs
+  <PointsCount>0</PointsCount>  ← AFTER Points; cloud quirk
+</Route>
+```
+
+The track encoding is identical to GPXtoCNXConverter — first
+record absolute (``lat,lon,ele*100``), second record
+``Δlat*1e7, Δlon*1e7, Δele*100``, subsequent records use the
+second difference for lat/lon (``ΔΔlat, ΔΔlon``) and the first
+difference for elevation (``Δele*100``). The cloud's XML wrapper
+differs in four places: no BOM, no pretty-printing, integer
+``<Ascent>`` / ``<Descent>``, and the ``<Navs/>`` /
+``<Points/>`` / ``<PointsCount>`` ordering quirk.
+
+**Locale gotcha for porters** (observed in the wild, May 2026): the
+``<Tracks>`` field uses commas as the *field separator within a
+record*. The absolute lat/lon at record 0 **must** be formatted
+with a period as the decimal separator — otherwise the first record
+becomes ``48,7561529,9,2263629,55241`` (five comma-separated
+tokens, not three) and the BSC200's parser falls off the rails.
+The symptom on the device is an "ETA / distance to goal" value
+that's off by hundreds of kilometres (we saw 693 km for a route
+that was actually 9 km long).
+
+Concretely:
+
+* **Python** (``ligpsport.cnx``) is safe by default: f-strings and
+  ``%``-format always use ``.`` regardless of ``LC_NUMERIC`` —
+  only the ``:n`` format spec is locale-aware, and we don't use it.
+* **Kotlin / Java** (``ligpsport-android``'s ``CnxEncoder``)
+  is **not** safe by default: ``"%.7f".format(v)`` and
+  ``String.format("%.7f", v)`` honour ``Locale.getDefault()``. Pin
+  the locale explicitly:
+  ```kotlin
+  String.format(Locale.ROOT, "%.7f", v)
+  ```
+* **C# / .NET** has the same trap: pin
+  ``CultureInfo.InvariantCulture`` on every ``ToString("F7")``.
+* **Go** is safe (``strconv.FormatFloat`` is locale-independent).
+* **JavaScript** is safe (``toFixed`` always uses ``.``); but
+  ``Intl.NumberFormat`` and ``toLocaleString`` are not.
+
+In short: the same rule that applies to JSON applies here. The
+file format is locale-neutral; the *emitter* must be too.
+
+This is what ``ligpsport.cnx.to_cnx_bytes`` emits and what
+``ligpsport.file_transfer.upload_general_file`` ships — verified
+end-to-end against the live BSC200: file_num bumped from 4 to 5
+after a CLI ``upload-route foo.gpx format=cnx`` call.
+
+The fixture at ``tests/fixtures/cnx_cloud_capture.cnx`` is the
+captured cloud CNX; the structural assumptions in the encoder
+are anchored against it in ``tests/test_cnx.py``.
+
+The reverse-engineered cloud API surface (i.igpsport.com,
+HTTPS, retrofit interface ``NewApiService``):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST   | `/service/mobile/api/Routes/UploadOssGenerateRoutes` | Trigger server-side GPX→CNX conversion. Body is JSON with the OSS object key, route name, description. Returns the assigned ``RouteId``. |
+| GET    | `/service/mobile/api/Routes/DownloadRoutes?RouteId=<id>&SupportDifferenceAlgorithm=<0\|2>&supportAuxiliaryPoint=<0\|1>` | Stream the converted CNX bytes. Response body is the raw file (``ResponseBody.bytes()`` in the app). Pass directly to :func:`upload_route_plan` via ``raw_bytes``. |
+| (OSS)  | (aliyuncs.com, presigned PUT) | The Aliyun OSS upload step. Credentials are minted server-side via a separate sts/sign endpoint. |
+
+The library's :func:`upload_route_plan` still implements the wire
+protocol correctly: chunking, CRCs, endType byte, FILE_USE commit,
+and per-chunk ACK handling all match the smali. The
+``raw_bytes`` parameter (and the CLI's ``.cnx`` file handling)
+let callers who already hold CNX bytes — e.g. fetched from the
+endpoint above, or extracted from a working app session — push
+them to the device unchanged. The client-side GPX-to-CNX gap is
+the blocker for end-to-end uploads, not the BLE transport. A
+``ligpsport.cloud`` wrapper around ``UploadOssGenerateRoutes`` +
+``DownloadRoutes`` is out of scope here (it would need an
+authenticated user session) but is a clean follow-on.
+
+:mod:`ligpsport.file_transfer` also exposes
 :func:`download_cycling_data` for the read direction (verified
 against the in-tree simulator; the BSC200 has no recorded rides on
 hand to verify against the live device).
@@ -457,6 +749,7 @@ pair and persist it; subsequent connects reuse it.
   also returns `mcu_firmware_ver=0`. Whether the BSC200 truly has
   no MCU firmware revision or simply doesn't expose it over BLE is
   unknown.
+
 ## 12. AGPS / ephemeris pre-seeding
 
 The BSC200 (and other iGS-series devices) accept an **AGPS / ephemeris
@@ -664,6 +957,7 @@ this failure as non-fatal so CI doesn't depend on a u-blox token.
 field when the piggybacked seed succeeds. Absence of the field means
 the AGPS step was skipped — no token, no network, or device rejection.
 The route upload itself succeeds or fails independently.
+
 ## 13. Position-prior injection (FACTORY GPS_COORDINATE_SET)
 
 AGPS supplies "which satellite is where in orbit" via UBX-MGA-EPH;
@@ -802,46 +1096,3 @@ Use `MOCK_LOCATION --ef lat --ef lon` first if the test rig has no
 real GPS fix. `PLAN_AND_UPLOAD` / `UPLOAD` lines gain
 `seed_lat=` + `seed_lon=` when the piggybacked injection succeeds;
 absence means the step was skipped (no fix or device rejection).
-
-## 14. Locale gotcha for CNX coordinate emitters
-
-Observed in the wild (May 2026): on a `de_DE`-locale Android phone
-the BSC200 displayed a "distance to goal" of 693 km for a route
-that's actually 9 km long.
-
-Root cause: the CNX `<Tracks>` field uses **commas as the
-field-separator within a record** (e.g. `48.7561529,9.2263629,55241;`
-for the absolute lat/lon/elevation of the first track point). The
-absolute lat/lon at record 0 therefore **must** be formatted with a
-period as its decimal separator. Locale-aware formatters that pick
-a comma decimal break that contract — the first record becomes
-`48,7561529,9,2263629,55241`, the BSC200's parser reads five
-comma-separated tokens instead of three, and every subsequent
-record mis-aligns from there.
-
-Concretely per language:
-
-* **Python** (`ligpsport.cnx._format_coord`) is safe by default:
-  f-strings and `%`-format always use `.` regardless of
-  `LC_NUMERIC` — only the `:n` format spec consults
-  `locale.localeconv`, and we don't use it. The docstring on
-  `_format_coord` calls this out for porters.
-* **Kotlin / Java** (`ligpsport-android`'s `CnxEncoder.formatCoord`)
-  is **not** safe by default: `"%.7f".format(v)` and
-  `String.format("%.7f", v)` honour `Locale.getDefault()`. Pin
-  the locale explicitly:
-  ```kotlin
-  String.format(Locale.ROOT, "%.7f", v)
-  ```
-  Tracked by the `coordinates_use_period_decimal_under_de_de_locale`
-  regression test in `CnxEncoderTest`.
-* **C# / .NET** has the same trap: pin
-  `CultureInfo.InvariantCulture` on every `ToString("F7")`.
-* **Go** is safe (`strconv.FormatFloat` is locale-independent).
-* **JavaScript** is safe (`Number.toFixed` always uses `.`); but
-  `Intl.NumberFormat` and `Number.toLocaleString` are not.
-
-Same rule as JSON: the file format is locale-neutral, so the
-*emitter* must be too. The captured cloud CNX
-(`tests/fixtures/cnx_cloud_capture.cnx`) is the byte-level
-reference — diff against it after any change to the encoder.

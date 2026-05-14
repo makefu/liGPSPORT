@@ -774,18 +774,75 @@ async def _r_upload_route(
     args: Sequence[str],
     timeout: float,
 ) -> UploadedRoute:
-    """Convert a GPX or geoJSON file to GPX and push it to the device."""
+    """Upload a route file to the device.
+
+    For ``.gpx`` / ``.geojson``, the file is parsed into a
+    :class:`routes.RouteData` and converted to CNX locally (see
+    :mod:`ligpsport.cnx`) before the upload — CNX is the only format
+    the BSC200 firmware accepts. GPX waypoints carry through to the
+    CNX ``<Points>`` list as POIs. For ``.cnx`` (iGPSPORT's
+    proprietary format), the bytes are uploaded verbatim — callers
+    who hold pre-converted CNX bytes (e.g. fetched from the iGPSPORT
+    cloud's ``Routes/DownloadRoutes`` endpoint) push them directly.
+    For ``.fit``, the parsed route is re-encoded as a Garmin Course
+    FIT file; left in the tree for sanity-checking new devices, but
+    BSC200 firmware rejects FIT same as raw GPX.
+
+    An optional ``format=fit|gpx|cnx`` token overrides the default.
+    See PROTOCOL.md §7.
+    """
+    import pathlib
+
     from . import routes as _routes
 
     if not args:
-        raise CommandError("upload-route takes <path> [file_id]")
-    path = args[0]
+        raise CommandError("upload-route takes <path> [file_id] [format=gpx|fit|cnx]")
+    positional: list[str] = []
+    forced_format: str | None = None
+    for arg in args:
+        if arg.startswith("format="):
+            forced_format = arg.split("=", 1)[1].lower()
+            continue
+        positional.append(arg)
+    if not positional:
+        raise CommandError("upload-route takes <path> [file_id] [format=...]")
+    path = positional[0]
     file_id = 1
-    if len(args) >= 2:
+    if len(positional) >= 2:
         try:
-            file_id = int(args[1])
+            file_id = int(positional[1])
         except ValueError as exc:
-            raise CommandError(f"invalid file_id: {args[1]!r}") from exc
+            raise CommandError(f"invalid file_id: {positional[1]!r}") from exc
+
+    p = pathlib.Path(path)
+    ext = p.suffix.lower().lstrip(".")
+    if forced_format is not None and forced_format not in {"gpx", "fit", "cnx"}:
+        raise CommandError(f"format= must be one of gpx|fit|cnx, got {forced_format!r}")
+    if ext == "cnx" and forced_format is None:
+        raw = p.read_bytes()
+        # The protobuf still needs a start coordinate, name and
+        # distance — without parsing the CNX content (proprietary)
+        # we fall back to zero-coordinates and a name from the
+        # filename. The BSC200 doesn't appear to validate these
+        # metadata fields against the CNX payload.
+        synthetic = _routes.RouteData(name=p.stem, points=())
+        status = await file_transfer.upload_route_plan(
+            client,
+            synthetic,
+            file_id=file_id,
+            file_extension="cnx",
+            timeout=max(30.0, timeout),
+            raw_bytes=raw,
+            raw_name=p.stem,
+        )
+        return UploadedRoute(
+            source=path,
+            name=p.stem,
+            points=0,
+            distance_m=0,
+            file_id=file_id,
+            status=status,
+        )
 
     try:
         route = _routes.load_route(path)
@@ -794,11 +851,27 @@ async def _r_upload_route(
     if not route.points:
         raise CommandError(f"{path!r} contains no usable points")
 
+    # Default for GPX / geoJSON / unknown extensions is CNX (the only
+    # format the BSC200 firmware accepts). FIT stays opt-in via the
+    # source-file extension or `format=fit`; raw GPX uploads stay
+    # behind `format=gpx` for testing newer firmwares.
+    wire_format = forced_format or (ext if ext == "fit" else "cnx")
+    # CNX uploads can carry GPX-defined waypoints as on-device POIs.
+    # geoJSON / FIT inputs have no native POI list the device acts on.
+    waypoints = None
+    if wire_format == "cnx" and ext in {"gpx", "geojson"}:
+        from . import cnx as _cnx
+
+        if ext == "gpx":
+            waypoints = _cnx.parse_gpx_waypoints(p.read_bytes())
+
     status = await file_transfer.upload_route_plan(
         client,
         route,
         file_id=file_id,
+        file_extension=wire_format,
         timeout=max(30.0, timeout),
+        waypoints=waypoints,
     )
     return UploadedRoute(
         source=path,
@@ -925,7 +998,11 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
     ),
     "upload-route": CommandSpec(
         name="upload-route",
-        description="Upload a GPX or geoJSON route file: upload-route <path> [file_id]",
+        description=(
+            "Upload a GPX / geoJSON / CNX / FIT route file (GPX & geoJSON "
+            "are converted to CNX locally): upload-route <path> [file_id] "
+            "[format=gpx|fit|cnx]"
+        ),
         runner=_r_upload_route,
     ),
     "set-rtc": CommandSpec(

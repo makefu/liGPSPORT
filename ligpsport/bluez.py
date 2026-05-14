@@ -44,7 +44,7 @@ import os
 from typing import TYPE_CHECKING, Final
 
 from . import framing, gatt
-from .transport import Transport, TransportClosed
+from .transport import Channel, Transport, TransportClosed
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -68,6 +68,17 @@ TX_UUIDS: Final[tuple[str, ...]] = (
     gatt.THIRD_TX_UUID,
     gatt.FOURTH_TX_UUID,
 )
+
+# Channel → write characteristic UUID. The Transport ABC accepts three
+# channels; we map them onto the same RX UUIDs the iGPSPORT app uses.
+# "control" is the primary command channel (the …-8e UART); "data" is
+# the bulk-data channel for gen<3 devices (…-9e); "fourth" is the
+# bulk-data channel for gen≥3 devices (…-6e). See PROTOCOL.md §7.
+_CHANNEL_RX_UUID: Final[dict[Channel, str]] = {
+    "control": gatt.PRIMARY_RX_UUID,
+    "data": gatt.DATA_RX_UUID,
+    "fourth": gatt.FOURTH_RX_UUID,
+}
 
 
 class BluezError(RuntimeError):
@@ -123,9 +134,14 @@ class BluezTransport(Transport):
         # DBus state (populated in open()).
         self._bus: object | None = None
         self._device_iface: object | None = None
-        # File descriptors and their MTUs returned by Acquire*.
-        self._write_fd: int | None = None
-        self._write_mtu: int = 23
+        # Per-channel write FDs (lazy: only "control" is acquired in
+        # open(); "data" and "fourth" are acquired on first use to keep
+        # the route-upload paths from blocking unrelated callers).
+        self._write_fds: dict[Channel, int] = {}
+        self._write_mtus: dict[Channel, int] = {}
+        # Char paths discovered at connect time and used later for lazy
+        # AcquireWrite. None until open() has walked the GATT tree.
+        self._chars_by_uuid: dict[str, str] | None = None
         self._notify_fds: list[int] = []
         # Inbox: complete reassembled frames.
         self._inbox: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -141,7 +157,12 @@ class BluezTransport(Transport):
 
     @property
     def mtu(self) -> int:
-        return self._write_mtu
+        """Negotiated MTU of the control channel (the primary command path)."""
+        return self._write_mtus.get("control", 23)
+
+    def channel_mtu(self, channel: Channel) -> int:
+        """Negotiated MTU of *channel*, or 23 if the channel is not yet acquired."""
+        return self._write_mtus.get(channel, 23)
 
     def _register_reader(self, fd: int) -> None:
         """Hook *fd* into the asyncio event loop for readability."""
@@ -203,30 +224,12 @@ class BluezTransport(Transport):
         # Walk the GATT tree to find our characteristics by UUID.
         managed = await self._get_managed_objects(bus)
         chars_by_uuid = self._index_chars_by_uuid(managed, device_path)
+        self._chars_by_uuid = chars_by_uuid
 
-        rx_path = chars_by_uuid.get(gatt.PRIMARY_RX_UUID)
-        if rx_path is None:
-            raise BluezError(
-                f"control RX characteristic {gatt.PRIMARY_RX_UUID} not exposed by device"
-            )
-
-        # AcquireWrite on the control RX. Returns (FD, MTU). The FD is
-        # a SOCK_SEQPACKET socket per BlueZ docs; writes go out as ATT
-        # Write Commands sized up to MTU.
-        rx_iface = await self._get_iface(bus, rx_path, GATT_CHAR_IFACE)
-        write_fd, write_mtu = await rx_iface.call_acquire_write({})  # type: ignore[attr-defined]
-        # dbus-fast returns a fd handle wrapped in `dbus_fast.signature.Variant`-like
-        # object; we duplicate it so closing our side doesn't tug the
-        # bus's reference.
-        self._write_fd = os.dup(write_fd)
-        os.close(write_fd)
-        self._write_mtu = int(write_mtu)
-        _LOG.info(
-            "BlueZ: AcquireWrite on %s -> fd=%d mtu=%d",
-            rx_path,
-            self._write_fd,
-            self._write_mtu,
-        )
+        # AcquireWrite on the control RX up front — every command needs
+        # it. Data / Fourth channels are acquired lazily on first use
+        # so we don't pay the round trip for users who never upload.
+        await self._acquire_write_channel("control")
 
         # AcquireNotify on every TX characteristic that exists.
         for tx_uuid in TX_UUIDS:
@@ -281,10 +284,11 @@ class BluezTransport(Transport):
             with contextlib.suppress(OSError):
                 os.close(fd)
         self._notify_fds.clear()
-        if self._write_fd is not None:
+        for fd in self._write_fds.values():
             with contextlib.suppress(OSError):
-                os.close(self._write_fd)
-            self._write_fd = None
+                os.close(fd)
+        self._write_fds.clear()
+        self._write_mtus.clear()
         # Disconnect the device (best-effort).
         if self._device_iface is not None:
             with contextlib.suppress(Exception):
@@ -298,18 +302,17 @@ class BluezTransport(Transport):
         # Wake up any pending receivers.
         await self._inbox.put(None)
 
-    async def send(self, frame: bytes) -> None:
-        if self._write_fd is None:
-            raise TransportClosed("transport not open")
+    async def send(self, frame: bytes, *, channel: Channel = "control") -> None:
+        fd = await self._get_write_fd(channel)
         # AcquireWrite returns the maximum ATT payload size for each
         # write — already net of the ATT header. The kernel's
         # SOCK_SEQPACKET socket truncates anything larger, so we cap
         # at the negotiated MTU directly (not MTU-3).
-        chunk = max(self._write_mtu, 20)
+        chunk = max(self._write_mtus[channel], 20)
         loop = asyncio.get_running_loop()
         for offset in range(0, len(frame), chunk):
             buf = frame[offset : offset + chunk]
-            await self._write_buf(loop, self._write_fd, buf)
+            await self._write_buf(loop, fd, buf)
 
     @staticmethod
     async def _write_buf(loop: asyncio.AbstractEventLoop, fd: int, buf: bytes) -> None:
@@ -333,6 +336,41 @@ class BluezTransport(Transport):
         return frame
 
     # ---- internal helpers ------------------------------------------
+
+    async def _get_write_fd(self, channel: Channel) -> int:
+        """Return the cached write FD for *channel*, acquiring it if needed."""
+        if self._closed:
+            raise TransportClosed("transport is closed")
+        fd = self._write_fds.get(channel)
+        if fd is not None:
+            return fd
+        await self._acquire_write_channel(channel)
+        return self._write_fds[channel]
+
+    async def _acquire_write_channel(self, channel: Channel) -> None:
+        """``AcquireWrite`` on the characteristic backing *channel*."""
+        if self._chars_by_uuid is None or self._bus is None:
+            raise TransportClosed("transport not open")
+        uuid = _CHANNEL_RX_UUID[channel]
+        rx_path = self._chars_by_uuid.get(uuid)
+        if rx_path is None:
+            raise BluezError(f"{channel} RX characteristic {uuid} not exposed by device")
+        rx_iface = await self._get_iface(self._bus, rx_path, GATT_CHAR_IFACE)
+        # AcquireWrite returns (FD, MTU). The FD is a SOCK_SEQPACKET
+        # socket per BlueZ docs; writes go out as ATT Write Commands
+        # sized up to MTU.
+        write_fd, write_mtu = await rx_iface.call_acquire_write({})  # type: ignore[attr-defined]
+        dup_fd = os.dup(write_fd)
+        os.close(write_fd)
+        self._write_fds[channel] = dup_fd
+        self._write_mtus[channel] = int(write_mtu)
+        _LOG.info(
+            "BlueZ: AcquireWrite on %s (%s channel) -> fd=%d mtu=%d",
+            rx_path,
+            channel,
+            dup_fd,
+            self._write_mtus[channel],
+        )
 
     async def _ensure_device_known(self, bus: object, adapter_path: str, device_path: str) -> None:
         """If BlueZ has never seen *address*, do a brief discovery."""

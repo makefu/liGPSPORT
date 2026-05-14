@@ -28,7 +28,9 @@ spec).
 | Real-time status streaming (`status --watch`) | yes         |
 | GPX / geoJSON route parsing + GPX emission    | yes (stdlib only) |
 | BlueZ-direct backend with MTU negotiation     | yes (`--backend bluez`) |
-| Route / map / theme upload                    | not yet (wire format known; pending btsnoop capture) |
+| Route upload — wire protocol                  | yes — FILE_OPERATION ADD (smali-verified + btsnoop-captured) |
+| Route upload — file format                    | local GPX → CNX conversion (stdlib only, no cloud round-trip); **live-verified on BSC200 firmware 2024-05-14** |
+| Map / theme upload                            | not yet (wire format known; pending btsnoop capture) |
 | Firmware upgrade                              | not yet     |
 | Live tracking (REAL_TIME_TRACE)               | not yet     |
 
@@ -150,4 +152,10 @@ all commands work with either one.
 
 ## License
 
-MIT.
+MIT — see [`LICENSE`](LICENSE).
+
+The GPX→CNX conversion in `ligpsport.cnx` is derived from
+[GPXtoCNXConverter](https://github.com/LudvvigB/GPXtoCNXConverter)
+(Apache License 2.0). Attribution and the verbatim upstream license
+are preserved in [`NOTICE`](NOTICE) and
+[`LICENSES/GPXtoCNXConverter-LICENSE`](LICENSES/GPXtoCNXConverter-LICENSE).

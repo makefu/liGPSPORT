@@ -26,10 +26,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from . import framing, gatt
-from .transport import Transport, TransportClosed
+from .transport import Channel, Transport, TransportClosed
+
+# Channel → write characteristic UUID. Matches BluezTransport's
+# _CHANNEL_RX_UUID; see PROTOCOL.md §7 for the iGPSPORT multi-channel
+# rationale.
+_CHANNEL_RX_UUID: Final[dict[Channel, str]] = {
+    "control": gatt.PRIMARY_RX_UUID,
+    "data": gatt.DATA_RX_UUID,
+    "fourth": gatt.FOURTH_RX_UUID,
+}
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -126,7 +135,7 @@ class BleakTransport(Transport):
     ) -> None:
         await self.close()
 
-    async def send(self, frame: bytes) -> None:
+    async def send(self, frame: bytes, *, channel: Channel = "control") -> None:
         if self._client is None:
             raise TransportClosed("transport not open")
         # The BSC200 negotiates a 23-byte BLE LL default MTU on BlueZ /
@@ -138,10 +147,11 @@ class BleakTransport(Transport):
         mtu = self._mtu() - self._ATT_HEADER_SIZE
         if mtu <= 0:
             mtu = self._DEFAULT_MTU - self._ATT_HEADER_SIZE
+        rx_uuid = _CHANNEL_RX_UUID[channel]
         for offset in range(0, len(frame), mtu):
             chunk = frame[offset : offset + mtu]
             await self._client.write_gatt_char(  # type: ignore[attr-defined]
-                gatt.PRIMARY_RX_UUID, chunk, response=True
+                rx_uuid, chunk, response=True
             )
 
     async def receive(self) -> bytes:

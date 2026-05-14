@@ -1,0 +1,200 @@
+"""End-to-end test for :func:`ligpsport.file_transfer.upload_route_plan`.
+
+Wires the simulator and client over a LoopbackTransport. Loads the
+checked-in OSM-exported route (``route.geojson``), uploads it, and
+asserts on the wire-level fingerprint:
+
+* every chunk's payload CRC at offset 9 matches CRC8 of the chunk,
+* endType=2 for all but the last chunk, endType=3 for the last,
+* the simulator reassembles the same bytes the client sent (GPX form
+  of the route),
+* the client returns ``status=0`` from the final ACK.
+"""
+
+from __future__ import annotations
+
+import math
+import pathlib
+
+import pytest
+
+from ligpsport import file_transfer
+from ligpsport.client import IgpsportClient
+from ligpsport.routes import Point, RouteData, load_route, to_gpx_bytes
+from ligpsport.simulator import Simulator, SimulatorState
+from ligpsport.transport import make_loopback_pair
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+async def _run_upload(
+    route: RouteData, *, chunk_size: int, generation: int
+) -> tuple[SimulatorState, int, list[int]]:
+    """Drive a route upload end-to-end and return ``(state, status, end_types)``."""
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState()
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        status = await file_transfer.upload_route_plan(
+            client,
+            route,
+            file_id=42,
+            file_extension="gpx",
+            chunk_size=chunk_size,
+            generation=generation,
+            device_name="BSC200",
+            timeout=2.0,
+        )
+    assert state.uploaded_routes, "simulator should have finalised one upload"
+    end_types = state.uploaded_routes[-1].end_types
+    return state, status, end_types
+
+
+async def test_upload_route_geojson_round_trip() -> None:
+    """The real osm-derived route, chunked at 512 bytes, gen-3 BSC200."""
+    route = load_route(str(_REPO_ROOT / "route.geojson"))
+    gpx_bytes = to_gpx_bytes(route)
+    state, status, end_types = await _run_upload(route, chunk_size=512, generation=3)
+
+    assert status == 0
+    # The simulator's reassembled content matches the GPX the client
+    # produced for the chunked stream. No mocks; both halves traverse
+    # the framing layer.
+    uploaded = state.uploaded_routes[-1]
+    assert uploaded.content == gpx_bytes
+    assert uploaded.file_id == 42
+    assert uploaded.extension == "gpx"
+    assert uploaded.name == route.name
+
+    expected_chunks = max(1, math.ceil(len(gpx_bytes) / 512))
+    assert len(end_types) == expected_chunks
+    # All but the last chunk carry endType=2; the last carries 3.
+    assert end_types[:-1] == [2] * (expected_chunks - 1)
+    assert end_types[-1] == 3
+
+    # The follow-up FILE_USE commit must land too: the simulator's
+    # active_route_id reflects the file_id we just uploaded.
+    assert state.active_route_id == 42
+
+
+async def test_upload_tiny_route_single_chunk() -> None:
+    """A one-point route fits in a single chunk → end_types == [3]."""
+    tiny = RouteData(
+        name="tiny",
+        points=(Point(latitude=52.5, longitude=13.4),),
+    )
+    state, status, end_types = await _run_upload(tiny, chunk_size=4096, generation=3)
+    assert status == 0
+    assert end_types == [3]
+    # Decoded protobuf still carries the correct metadata.
+    uploaded = state.uploaded_routes[-1]
+    assert uploaded.name == "tiny"
+    assert uploaded.content == to_gpx_bytes(tiny)
+
+
+async def test_upload_chunk_count_matches_chunk_size() -> None:
+    """A precisely-sized route splits into the expected number of chunks."""
+    # Build a route whose GPX serialisation is comfortably over 1KB so
+    # we exercise the multi-chunk path.
+    points = tuple(Point(latitude=52.5 + i * 1e-4, longitude=13.4 + i * 1e-4) for i in range(60))
+    big = RouteData(name="multi", points=points)
+    gpx = to_gpx_bytes(big)
+    assert len(gpx) > 1024  # exercise the multi-chunk path
+
+    state, status, end_types = await _run_upload(big, chunk_size=256, generation=3)
+    assert status == 0
+    expected = math.ceil(len(gpx) / 256)
+    assert len(end_types) == expected
+    assert end_types[-1] == 3
+    assert all(et == 2 for et in end_types[:-1])
+    assert state.uploaded_routes[-1].content == gpx
+
+
+async def test_upload_raw_bytes_passes_through() -> None:
+    """``raw_bytes`` with a non-CNX extension goes through the
+    ROUTE_PLAN FILE_SEND chunked path verbatim.
+
+    CNX uploads use a different wire protocol (FILE_OPERATION ADD —
+    see ``test_file_operation_upload_format`` below); this test
+    covers the GPX/FIT/TCX/XML path that still uses ROUTE_PLAN.
+    """
+    raw = b"\x89GPX\r\n\x1a\n" + bytes(range(256)) * 4  # ~1KB, multi-chunk
+    route = RouteData(
+        name="from-cloud",
+        points=(Point(latitude=52.5, longitude=13.4),),
+    )
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState()
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        status = await file_transfer.upload_route_plan(
+            client,
+            route,
+            file_id=7,
+            file_extension="gpx",
+            chunk_size=256,
+            generation=3,
+            device_name="BSC200",
+            timeout=2.0,
+            raw_bytes=raw,
+            raw_name="from-cloud",
+        )
+    assert status == 0
+    uploaded = state.uploaded_routes[-1]
+    assert uploaded.content == raw
+    assert uploaded.extension == "gpx"
+    assert uploaded.file_id == 7
+    assert state.active_route_id == 7
+
+
+def test_file_operation_upload_format() -> None:
+    """Verify the byte-level shape of the FILE_OPERATION upload payload.
+
+    The full live round-trip is covered by
+    ``test_bsc200_live::test_live_upload_cnx_via_file_operation``;
+    this hermetic check anchors the head + protobuf encoding so we
+    notice regressions without needing the device.
+    """
+    head = file_transfer._build_file_operation_head(
+        operate=file_transfer._SERVICE_OPERATE_TYPE_ADD,
+    )
+    # Captured cloud head, byte for byte:
+    #   01 15 ff aa 03 ff ff 00 00 00 01 ff*8 57
+    assert head.hex() == "0115ffaa03ffff00000001ffffffffffffffff57"
+
+    pb = file_transfer._build_general_file_operation_pb(
+        file_type=file_transfer.FILE_OP_TYPE_ROUTE_PLAN,
+        file_size=3254,
+        file_id=3130362,
+        file_name="From Tiefenbachstraße 30, 70329, Stuttgart to Hohenstaufens",
+        file_extension="cnx",
+    )
+    # Decode back via the captured byte structure: field 1=21, 2=3,
+    # 3=2, 4=3254, 5=3130362, 6=name, 7="cnx".
+    assert pb.startswith(bytes([0x08, 0x15]))  # field 1 (varint) = 21
+    assert bytes([0x10, 0x03]) in pb  # field 2 (varint) = 3 (ADD)
+    assert bytes([0x18, 0x02]) in pb  # field 3 (varint) = 2 (ROUTE_PLAN)
+    # file_extension is the last field, length 3 = "cnx".
+    assert pb.endswith(b"\x3a\x03cnx")
+
+
+def test_confirm_header_layout() -> None:
+    """Verify the 20-byte trailer layout (offsets, CRCs, endType byte)."""
+    payload = b"\x01\x02\x03\x04" * 10  # 40 bytes
+    header = file_transfer._build_route_plan_confirm_header(payload, end_type=3)
+    assert len(header) == 20
+    assert header[0] == 0x01  # END_TYPE_PB
+    assert header[1] == 7  # ROUTE_PLAN service ordinal
+    assert header[4] == 4  # FILE_SEND operation value
+    assert header[7:9] == len(payload).to_bytes(2, "big")
+    # Payload CRC: CRC8 of the protobuf bytes. Calling the public
+    # framing helper gives us the reference value.
+    from ligpsport import framing
+
+    assert header[9] == framing.crc8(payload)
+    assert header[10] == 3  # endType
+    assert header[11:19] == b"\xff" * 8
+    assert header[19] == framing.crc8(header[:19])
+
+
+def test_confirm_header_rejects_invalid_end_type() -> None:
+    with pytest.raises(ValueError):
+        file_transfer._build_route_plan_confirm_header(b"x", end_type=1)

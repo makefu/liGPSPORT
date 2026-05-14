@@ -1,27 +1,59 @@
 """Chunked file upload / download helpers for the iGPSPORT BLE protocol.
 
-The wire mechanic is the same for every file type: each chunk is a
-``PbFrame`` whose payload is the per-service container message (e.g.
-``cycling_data_msg`` for rides, ``route_plan_data_msg`` for routes)
-with the chunk bytes in the ``file_content`` field. The 20-byte
-header's ``file_tag`` field (offset 3) increments per chunk so the
-receiver can drop duplicates.
+For **downloads** (e.g. recorded ride files), the client issues a
+``FILE_GET`` request that identifies the file (by timestamp for rides,
+by id for routes). The device then streams ``FILE_SEND`` frames until
+the requested file size is satisfied. The library accumulates
+``file_content`` bytes until the cumulative count matches the size
+reported by the preceding LIST_GET (or by the ``file_size`` field in
+the request).
 
-For **downloads**, the client issues a ``FILE_GET`` request that
-identifies the file (by timestamp for rides, by id for routes). The
-device then streams ``FILE_SEND`` frames until the requested file
-size is satisfied. The library accumulates ``file_content`` bytes
-until the cumulative count matches the size reported by the
-preceding LIST_GET (or by the ``file_size`` field in the request).
+For **route uploads** (``upload_route_plan``), the protocol is a
+two-characteristic chunked stream — *not* the standard PbFrame layout
+the read commands use. The mechanic was reverse-engineered from
+``IGPDeviceManager.sendRoutePlanFile`` in the iGPSPORT Android APK
+(line range 24586-24996 of the c4 smali); the byte-level spec lives
+in ``docs/PROTOCOL.md`` §7. Summary, per chunk:
 
-For **uploads**, the client splits the source bytes into chunks
-sized to fit the BLE MTU. Each chunk goes out as a separate
-``FILE_SEND`` (or ``ADD_FILE`` for training files); the device
-ack-replies with a ``ConfirmFrame``.
+1. Build a ``route_plan_data_msg`` protobuf with the file metadata
+   (id, name, type, total distance) and ``file_content = <chunk>``.
+   Serialise to ``sendData`` — **raw protobuf bytes**, no 20-byte
+   header.
+2. Build a 20-byte ``confirmData`` header (same shape as a
+   :class:`framing.Frame` PbFrame for ROUTE_PLAN / FILE_SEND) with
+   ``payload_size = len(sendData)``, a CRC8 over ``sendData`` at
+   offset 9, and an ``endType`` byte at offset 10 — ``2`` for every
+   chunk except the last, ``3`` for the last chunk. The CRC at
+   offset 19 covers bytes 0..18.
+3. Write ``sendData`` to the **data** characteristic (the
+   ``…-9e`` UART, called ``mRxCharacteristic`` in the smali) for
+   generation-1/2 devices, or to the **fourth** characteristic
+   (``…-6e``) for generation-3+ devices.
+4. Write ``confirmData`` to the **control** characteristic
+   (``…-8e``).
+5. Wait for the device's ACK on the notify side: a 20-byte
+   :class:`framing.Frame` with ``service=ROUTE_PLAN``,
+   ``operation=FILE_SEND``, and a ``status`` byte at offset 7.
+   The byte is a ``DeviceReturnStatus`` ordinal (see
+   :data:`_STATUS_NAMES`):
+   * ``status=0`` (Success) → advance to next chunk; on the *last*
+     chunk this means the upload is complete.
+   * ``status=4`` (QuantityIsFull) → the device terminates early
+     (queue drained); also treat as success.
+   * any other status → device rejected the upload. The library
+     raises :class:`RouteUploadError`. The BSC200's firmware
+     returns ``status=1`` (DataError) for every chunk when the
+     content is not in CNX format — see PROTOCOL.md §7.1.
 
-This module exposes the two primitives :func:`download_cycling_data`
-and (when implemented) :func:`upload_route_plan` etc. The CLI's
-``get-ride`` subcommand sits on top of the cycling-data downloader.
+6. After all chunks have been ACKed, issue a single ``FILE_USE``
+   command (operation=5) with no ``file_content`` to commit the
+   upload. Same two-write pattern (data + control). Mirrors
+   ``setRoutePlanFile`` in the smali, which the app always invokes
+   after a successful ``sendRoutePlanFile``.
+
+This module exposes :func:`download_cycling_data` and
+:func:`upload_route_plan`. The CLI's ``get-ride`` and
+``upload-route`` subcommands sit on top of them.
 """
 
 from __future__ import annotations
@@ -29,16 +61,133 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import TYPE_CHECKING
+import math
+import struct
+from typing import TYPE_CHECKING, Final
 
 from . import framing
-from .proto import common_pb2, cycling_data_pb2, general_file_operation_pb2
+from .proto import common_pb2, cycling_data_pb2, route_plan_pb2
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .client import IgpsportClient
+    from .cnx import Waypoint
     from .routes import RouteData
+    from .transport import Channel
 
 _LOG = logging.getLogger(__name__)
+
+# Per-chunk endType byte (offset 10 of confirmData). Source:
+# `sendRoutePlanFile` smali line 24846-24851 (`const/4 v2, 3` / `const/4 v2, 2`).
+_END_TYPE_CONTINUE: Final[int] = 2  # not the last chunk
+_END_TYPE_LAST: Final[int] = 3  # last chunk
+
+# Device-reply status byte (offset 7 of the ACK ConfirmFrame). Source:
+# `com.igpsport.blelib.DeviceReturnStatus` enum. Maps the device's
+# generic "command outcome" byte:
+#
+#   0 = Success
+#   1 = DataError                   ← rejection (e.g. wrong file format)
+#   2 = MemoryError
+#   3 = LowBattery
+#   4 = QuantityIsFull / DoneEarly  ← for route-plan FILE_SEND this also
+#                                     means "queue cleanup, stop"
+#   5 = IsBeingUsed
+#   6 = UnsupportedCommand
+#   ... (full table in PROTOCOL.md §7)
+#
+# For chunked route uploads the receive handler treats status=0 +
+# isLastPack as "done" (success). status=4 is "early done / queue
+# drained". Every other value (including the BSC200's persistent
+# status=1) is a device-side rejection that the app's
+# `checkIsFinish` would raise as `DeviceReturnsErrorCode` and
+# retry; the library surfaces it as :class:`RouteUploadError`.
+_STATUS_OK: Final[int] = 0
+_STATUS_DATA_ERROR: Final[int] = 1
+_STATUS_DONE_EARLY: Final[int] = 4
+
+# Filename length limit by device name. Source: `sendRoutePlanFile`
+# smali line 24648-24705 — BSC200 falls in the 60-byte group with
+# BSC300, iGS320 variants and iGS630.
+_FILENAME_MAX_BY_DEVICE: Final[dict[str, int]] = {
+    "BSC200": 60,
+    "BSC300": 60,
+    "iGS320": 60,
+    "iGS320-": 60,
+    "iGS320-V2": 60,
+    "iGS630": 60,
+    "iGS620": 28,
+    "iGS520": 50,
+}
+_FILENAME_MAX_DEFAULT: Final[int] = 40
+
+# Default chunk size when the device has not reported a sendFileMtuSize.
+# Source: `DeviceInfoHelper.getDeviceInfo` smali fallback table — gen-3
+# computers (iGS520/iGS320/iGS50S/iGS10S) use 512; gen-2/4 use 4096.
+# 512 is the safe default for an unknown gen-3 device.
+_DEFAULT_CHUNK_SIZE: Final[int] = 512
+
+# Protobuf enum values, mirrored here so the upload code stays
+# self-contained even if the generated module's enum aliasing changes.
+_ROUTE_PLAN_OPERATE_TYPE_FILE_SEND: Final[int] = (
+    route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_SEND
+)
+_ROUTE_PLAN_FILE_TYPE_BY_EXT: Final[dict[str, int]] = {
+    "cnx": route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_CNX,
+    "gpx": route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_GPX,
+    "fit": route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_FIT,
+    "tcx": route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_TCX,
+    "xml": route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_XML,
+}
+
+
+# Friendly names for the device-status byte. Keeps error messages
+# readable; the integer is still authoritative.
+_STATUS_NAMES: Final[dict[int, str]] = {
+    0: "Success",
+    1: "DataError",
+    2: "MemoryError",
+    3: "LowBattery",
+    4: "QuantityIsFull",
+    5: "IsBeingUsed",
+    6: "UnsupportedCommand",
+    7: "WifiConnectionSucceeded",
+    8: "WifiWrongPassword",
+    9: "WifiConnectionTimedOut",
+    10: "WifiNotConnected",
+    11: "WifiPleaseEnterPassword",
+    12: "WifiMapDownload",
+    13: "WifiFirmwareDownload",
+    14: "WifiCyclingActivityIsUploading",
+    15: "NavigationRouteDeletionFailed",
+    16: "NavigationRouteDoesNotExist",
+}
+
+
+def _status_name(status: int) -> str:
+    return _STATUS_NAMES.get(status, f"unknown({status})")
+
+
+class RouteUploadError(RuntimeError):
+    """Raised when the BSC200 rejects a route-plan upload chunk.
+
+    The device's status byte is the ``DeviceReturnStatus`` ordinal
+    (see :data:`_STATUS_NAMES`). status=1 ("DataError") is the most
+    common rejection — the BSC200 firmware only accepts CNX-format
+    route files; uploading raw GPX yields a persistent DataError on
+    every chunk. PROTOCOL.md §7 has the details.
+    """
+
+    def __init__(self, status: int, chunk_index: int, total_chunks: int):
+        super().__init__(
+            f"device rejected route upload chunk {chunk_index}/{total_chunks} "
+            f"with status={status} ({_status_name(status)})"
+        )
+        self.status = status
+        self.status_name = _status_name(status)
+        self.chunk_index = chunk_index
+        self.total_chunks = total_chunks
 
 
 async def download_cycling_data(
@@ -71,11 +220,6 @@ async def download_cycling_data(
     accumulated = bytearray()
     deadline = asyncio.get_running_loop().time() + overall_timeout
 
-    # The first reply is delivered through `request`; subsequent chunks
-    # arrive as unsolicited frames on the same service.
-    # Subscribe first so we don't race the first follow-up chunk.
-    from .proto import common_pb2
-
     async def consume(sub_iter):
         nonlocal accumulated
         async for response in sub_iter:
@@ -93,14 +237,12 @@ async def download_cycling_data(
     sub_iter = client.subscribe(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA)
     consumer = asyncio.create_task(consume(sub_iter))
     try:
-        # Fire the initial request; its response is itself a chunk.
         response = await client.request(request, timeout=chunk_timeout)
         if isinstance(response.message, cycling_data_pb2.cycling_data_msg):
             chunk = response.message.file_content
             if chunk:
                 accumulated.extend(chunk)
 
-        # If the first chunk already satisfies expected_size, we're done.
         if expected_size is None or len(accumulated) < expected_size:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(consumer, timeout=overall_timeout)
@@ -111,90 +253,530 @@ async def download_cycling_data(
     return bytes(accumulated)
 
 
+def _truncate_filename(name: str, device_name: str | None) -> str:
+    """Clip *name* to the device's UTF-8 byte limit.
+
+    Mirrors the iGPSPORT app: encode to UTF-8, truncate by byte count,
+    decode with ``errors="replace"``, then strip the replacement
+    character so the result always ends on a complete codepoint.
+    Source: `sendRoutePlanFile` smali 24711-24725.
+    """
+    limit = _FILENAME_MAX_BY_DEVICE.get(device_name or "", _FILENAME_MAX_DEFAULT)
+    encoded = name.encode("utf-8")
+    if len(encoded) <= limit:
+        return name
+    clipped = encoded[:limit].decode("utf-8", errors="replace")
+    return clipped.replace("�", "")
+
+
+def _build_route_plan_chunk_pb(
+    *,
+    file_id: int,
+    file_extension: str,
+    file_name: str,
+    chunk: bytes,
+    total_distance: int,
+    longitude_start: float = 0.0,
+    latitude_start: float = 0.0,
+) -> bytes:
+    """Build the protobuf body for one route-plan upload chunk.
+
+    Mirrors `RoutePlanServiceFactory.getMessage` (smali 188-325):
+    every chunk repeats the full metadata (id, name, file_type,
+    total_distance, line_id, start lon/lat) and carries the chunk
+    bytes in ``file_content``.
+    """
+    msg = route_plan_pb2.route_plan_data_msg()
+    msg.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN
+    msg.route_plan_operate_type = _ROUTE_PLAN_OPERATE_TYPE_FILE_SEND
+    msg.line_id.append(f"{file_id}.{file_extension}")
+    info = msg.route_plan_info_msg.add()
+    info.id = file_id
+    info.file_type = _ROUTE_PLAN_FILE_TYPE_BY_EXT.get(
+        file_extension.lower(),
+        route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_INVALID,
+    )
+    info.name = file_name
+    info.total_distance = max(0, int(total_distance))
+    info.longitude_start = float(longitude_start)
+    info.latitude_start = float(latitude_start)
+    msg.file_content = chunk
+    return bytes(msg.SerializeToString())
+
+
+def _build_route_plan_confirm_header(send_data: bytes, *, end_type: int) -> bytes:
+    """Build the 20-byte confirm header for one route-plan upload chunk.
+
+    Mirrors `BaseFactory.confirmCommandByteArray` (smali 112-185)
+    parameterised for ROUTE_PLAN / FILE_SEND:
+
+    * offset 0  : 0x01 (END_TYPE_PB literal)
+    * offset 1  : service = ROUTE_PLAN ordinal = 7
+    * offset 4  : operation = FILE_SEND.getNumber() = 4
+    * offsets 7-8: BE u16 = len(send_data)
+    * offset 9  : CRC8(send_data)
+    * offset 10 : *end_type* (2 = continue, 3 = last)
+    * offsets 11-18: 0xFF padding
+    * offset 19 : CRC8(bytes 0..18)
+    """
+    if end_type not in (_END_TYPE_CONTINUE, _END_TYPE_LAST):
+        raise ValueError(f"end_type must be 2 or 3, got {end_type}")
+    size = len(send_data)
+    if size > 0xFFFF:
+        raise ValueError(f"chunk too large for u16 size field: {size} bytes")
+
+    header = bytearray(framing.HEADER_SIZE)
+    header[framing.HDR_TYPE] = framing.TYPE_PB
+    header[framing.HDR_SERVICE] = common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN & 0xFF
+    header[framing.HDR_SUB_SERVICE] = 0xFF
+    header[framing.HDR_FILE_TAG] = 0xFF
+    header[framing.HDR_OPERATION] = _ROUTE_PLAN_OPERATE_TYPE_FILE_SEND & 0xFF
+    header[framing.HDR_SUB_OPERATION] = 0xFF
+    header[framing.HDR_RESERVED_6] = 0xFF
+    header[framing.HDR_PAYLOAD_SIZE] = (size >> 8) & 0xFF
+    header[framing.HDR_PAYLOAD_SIZE + 1] = size & 0xFF
+    header[framing.HDR_PAYLOAD_CRC] = framing.crc8(send_data)
+    header[framing.HDR_END_MARKER] = end_type
+    for off in range(11, 19):
+        header[off] = 0xFF
+    header[framing.HDR_HEADER_CRC] = framing.crc8(bytes(header[: framing.HDR_HEADER_CRC]))
+    return bytes(header)
+
+
+def _route_chunks(data: bytes, chunk_size: int) -> list[bytes]:
+    """Split *data* into ``chunk_size``-byte slices (last may be short)."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive: {chunk_size}")
+    if not data:
+        # Empty payload still needs one (empty) chunk so the device sees
+        # a terminator. Matches the smali, which always loops at least
+        # once on a non-null fileBytes parameter.
+        return [b""]
+    n = math.ceil(len(data) / chunk_size)
+    return [data[i * chunk_size : (i + 1) * chunk_size] for i in range(n)]
+
+
+def _build_file_use_pb(*, file_id: int, file_extension: str) -> bytes:
+    """Build a route_plan_data_msg with operate_type=FILE_USE.
+
+    Mirrors `IGPDeviceManager.setRoutePlanFile` (smali 27391-27430):
+    one line_id of ``"<file_id>.<ext>"`` and one info_msg with id +
+    file_type. No file_content. This is the **commit / use** command
+    sent after all FILE_SEND chunks finish.
+    """
+    msg = route_plan_pb2.route_plan_data_msg()
+    msg.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN
+    msg.route_plan_operate_type = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE
+    msg.line_id.append(f"{file_id}.{file_extension}")
+    info = msg.route_plan_info_msg.add()
+    info.id = file_id
+    info.file_type = _ROUTE_PLAN_FILE_TYPE_BY_EXT.get(
+        file_extension.lower(),
+        route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_INVALID,
+    )
+    return bytes(msg.SerializeToString())
+
+
+def _build_file_use_header(send_data: bytes) -> bytes:
+    """Standard 20-byte PbFrame header for the FILE_USE protobuf body.
+
+    No ``endType`` quirk — this is a single-frame command, not a
+    chunked stream — so byte 10 is the standard ``END_TYPE_PB``
+    literal (0x01).
+    """
+    header = bytearray(framing.HEADER_SIZE)
+    header[framing.HDR_TYPE] = framing.TYPE_PB
+    header[framing.HDR_SERVICE] = common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN & 0xFF
+    header[framing.HDR_SUB_SERVICE] = 0xFF
+    header[framing.HDR_FILE_TAG] = 0xFF
+    header[framing.HDR_OPERATION] = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE & 0xFF
+    header[framing.HDR_SUB_OPERATION] = 0xFF
+    header[framing.HDR_RESERVED_6] = 0xFF
+    size = len(send_data)
+    header[framing.HDR_PAYLOAD_SIZE] = (size >> 8) & 0xFF
+    header[framing.HDR_PAYLOAD_SIZE + 1] = size & 0xFF
+    header[framing.HDR_PAYLOAD_CRC] = framing.crc8(send_data)
+    header[framing.HDR_END_MARKER] = framing.TYPE_PB
+    for off in range(11, 19):
+        header[off] = 0xFF
+    header[framing.HDR_HEADER_CRC] = framing.crc8(bytes(header[: framing.HDR_HEADER_CRC]))
+    return bytes(header)
+
+
 async def upload_route_plan(
     client: IgpsportClient,
     route: RouteData,
     *,
     file_id: int = 1,
     file_extension: str = "gpx",
+    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+    generation: int = 3,
+    device_name: str | None = None,
     timeout: float = 30.0,
+    send_file_use: bool = True,
+    raw_bytes: bytes | None = None,
+    raw_name: str | None = None,
+    waypoints: Sequence[Waypoint] | None = None,
 ) -> int:
     """Upload *route* to the device as a route_plan file.
 
-    Returns the status byte from the device's ConfirmFrame reply (0
-    means success; non-zero means the device rejected the upload).
+    Returns the final status byte from the device (``0 = Success``
+    per ``DeviceReturnStatus``).
 
-    The upload mechanic is **not** the standard PbFrame layout — it's
-    a bespoke ``FILE_OPERATION`` envelope discovered in
-    ``IGPDeviceManager.sendRoutePlanFileSingleChannel``:
+    *generation* selects the data-bearing characteristic: gen ≥ 3
+    writes chunks to the **fourth** channel (``…-6e``); gen < 3
+    writes them to the **data** channel (``…-9e``). BSC200 is gen 3
+    by analogy with BSC300/iGS320/iGS520 (it is **not** gen 4 — the
+    smali calls ``sendRoutePlanFileSingleChannel`` only for iGS630).
+    *device_name* is used to pick the filename-length limit (default
+    40 bytes if unknown).
 
-    1. 20-byte header with ``service=21 (FILE_OPERATION)`` and
-       ``operation=3 (SERVICE_OPERATE_TYPE_ADD)``. The header's
-       payload-size field is **0** — the device dispatches on the
-       (service, operation) tuple instead of reading a length here.
-    2. 4-byte **big-endian** length prefix giving the size in bytes
-       of the next field.
-    3. A ``general_file_operation`` protobuf message announcing the
-       upload (file_type=ROUTE_PLAN, file_id, file_extension,
-       file_name, file_size).
-    4. The raw file content (the GPX/CNX/FIT/... bytes themselves).
+    *send_file_use* controls whether a follow-up ``FILE_USE`` command
+    is sent after the last chunk (mirrors
+    ``setRoutePlanFile`` in the smali — the app always issues this to
+    commit the upload). Default: True.
 
-    The whole blob is then written to the BLE RX characteristic in
-    MTU-sized chunks like any other frame; the device knows to expect
-    ``file_size`` bytes of content because that's what the gfo
-    message announces.
+    *raw_bytes* and *raw_name*, if given, bypass the serialisers and
+    upload the bytes verbatim. Use this for pre-baked payloads (e.g.
+    a CNX file fetched directly from the iGPSPORT cloud's
+    ``Routes/DownloadRoutes`` endpoint). When *raw_bytes* is set,
+    *route* is still consulted for the start coordinate and distance.
 
-    The iGPSPORT app hardcodes ``file_extension="cnx"`` in
-    ``IGPDeviceManager`` even though the on-device parser also
-    accepts GPX. This function defaults to ``"gpx"`` so callers can
-    upload OSM-exported routes verbatim.
+    When *file_extension* is ``"cnx"`` and *raw_bytes* is ``None``,
+    *route* is converted to CNX locally via :func:`ligpsport.cnx.to_cnx_bytes`
+    — sidesteps the iGPSPORT cloud round-trip the Android app
+    requires. *waypoints*, if provided, populate the CNX
+    ``<Points>`` list (POIs); only consulted for the CNX path.
+
+    Raises :class:`RouteUploadError` if any chunk's ACK has a status
+    byte that isn't ``Success`` (0) or ``QuantityIsFull`` (4 — also
+    used as the "done early / queue drained" signal during chunked
+    sends). The BSC200 returns ``DataError`` (1) for every chunk
+    when the file content is the wrong format — see PROTOCOL.md §7.
+
+    Raises :class:`asyncio.TimeoutError` (the standard one) if a
+    chunk's ACK doesn't arrive within *timeout* seconds.
     """
     from .routes import to_gpx_bytes
 
-    gpx_bytes = to_gpx_bytes(route)
-
-    gfo = general_file_operation_pb2.general_file_operation()
-    gfo.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_FILE_OPERATION
-    gfo.operate_type = common_pb2.enum_SERVICE_OPERATE_TYPE_ADD
-    gfo.file_type = general_file_operation_pb2.enum_FILE_TYPE_ROUTE_PLAN
-    gfo.file_id = file_id
-    gfo.file_extension = file_extension
-    gfo.file_name = route.name
-    gfo.file_size = len(gpx_bytes)
-    gfo_bytes = gfo.SerializeToString()
-
-    # The 20-byte header: payload_size=0, service=FILE_OPERATION, op=ADD.
-    header = framing.build_frame(
-        framing.Frame(
-            service=common_pb2.enum_SERVICE_TYPE_INDEX_FILE_OPERATION,
-            operation=common_pb2.enum_SERVICE_OPERATE_TYPE_ADD,
-            payload=b"",
+    ext_lower = file_extension.lower()
+    if raw_bytes is not None and ext_lower == "cnx":
+        # CNX uploads go via FILE_OPERATION regardless of whether
+        # the bytes were locally generated or cloud-fetched.
+        source_name = raw_name if raw_name is not None else route.name
+        file_name = _truncate_filename(source_name, device_name)
+        return await upload_general_file(
+            client,
+            raw_bytes,
+            file_type=FILE_OP_TYPE_ROUTE_PLAN,
+            file_id=file_id,
+            file_name=file_name,
+            file_extension="cnx",
+            timeout=timeout,
         )
-    )
-    length_prefix = len(gfo_bytes).to_bytes(4, "big")
-    blob = header + length_prefix + gfo_bytes + gpx_bytes
+    if raw_bytes is not None:
+        file_bytes = raw_bytes
+        source_name = raw_name if raw_name is not None else route.name
+    elif ext_lower == "fit":
+        # FIT-encoded Course file. The BSC200 firmware rejects GPX
+        # (status=1 = DataError) but the route_plan protobuf
+        # enumerates FIT as a valid file_type, so this is one
+        # candidate format that might land on the device without
+        # the CNX cloud round-trip.
+        from .fit_course import to_fit_course_bytes
+
+        file_bytes = to_fit_course_bytes(route)
+        source_name = route.name
+    elif ext_lower == "cnx":
+        # Local GPX→CNX conversion. The BSC200 only parses
+        # iGPSPORT's proprietary CNX format; ligpsport.cnx emits
+        # bytes that match a captured cloud upload byte-for-byte
+        # (see docs/PROTOCOL.md §7.1.2). Live-verified working on
+        # BSC200 firmware 2024-05-14 via the FILE_OPERATION ADD
+        # service — which is a different wire protocol than the
+        # ROUTE_PLAN FILE_SEND path below, so dispatch out early.
+        from .cnx import to_cnx_bytes
+
+        file_bytes = to_cnx_bytes(route, waypoints=waypoints or ())
+        source_name = raw_name if raw_name is not None else route.name
+        file_name = _truncate_filename(source_name, device_name)
+        return await upload_general_file(
+            client,
+            file_bytes,
+            file_type=FILE_OP_TYPE_ROUTE_PLAN,
+            file_id=file_id,
+            file_name=file_name,
+            file_extension="cnx",
+            timeout=timeout,
+        )
+    else:
+        file_bytes = to_gpx_bytes(route)
+        source_name = route.name
+    file_name = _truncate_filename(source_name, device_name)
+    chunks = _route_chunks(file_bytes, chunk_size)
+    n = len(chunks)
+    # First point as the route's start coordinate (the iGPSPORT firmware
+    # uses these for the navigation entry icon).
+    first = route.points[0] if route.points else None
+    lon_start = first.longitude if first is not None else 0.0
+    lat_start = first.latitude if first is not None else 0.0
+    data_channel: Channel = "fourth" if generation >= 3 else "data"
     _LOG.debug(
-        "upload route: header=%d gfo=%d file=%d total=%d",
-        len(header),
-        len(gfo_bytes),
-        len(gpx_bytes),
-        len(blob),
+        "uploading route '%s' (%d bytes, %d chunks @ %d, gen=%d, channel=%s)",
+        file_name,
+        len(file_bytes),
+        n,
+        chunk_size,
+        generation,
+        data_channel,
     )
 
-    # Subscribe to FILE_OPERATION replies before sending so we don't
-    # race the device's ack.
-    sub = client.subscribe(common_pb2.enum_SERVICE_TYPE_INDEX_FILE_OPERATION)
-    # Send the whole blob in one go via the client's underlying
-    # transport. We bypass `request()` because that wraps the payload
-    # in another build_frame call; here the wire bytes are already
-    # framed (plus the extra length-prefixed bits).
-    await client._transport.send(blob)  # type: ignore[attr-defined]
-
+    # Subscribe **eagerly** to ROUTE_PLAN replies before sending the
+    # first chunk. `client.subscribe` is a lazy generator — its
+    # subscriber queue isn't registered with the dispatcher until the
+    # first `await __anext__()`. With BlueZ's MTU-247 path the device
+    # can ack a chunk before our generator advances that far, and the
+    # frame ends up dropped because nobody is listening for the
+    # service yet. `open_subscription` registers synchronously.
+    queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN)
+    last_status = -1
     try:
-        response = await asyncio.wait_for(sub.__anext__(), timeout=timeout)
-    except (StopAsyncIteration, TimeoutError) as exc:
-        raise TimeoutError("no FILE_OPERATION reply from device") from exc
+        for i, chunk in enumerate(chunks):
+            end_type = _END_TYPE_LAST if i == n - 1 else _END_TYPE_CONTINUE
+            send_data = _build_route_plan_chunk_pb(
+                file_id=file_id,
+                file_extension=file_extension,
+                file_name=file_name,
+                chunk=chunk,
+                total_distance=route.distance_m,
+                longitude_start=lon_start,
+                latitude_start=lat_start,
+            )
+            confirm_data = _build_route_plan_confirm_header(send_data, end_type=end_type)
+            # The data chunk (raw protobuf bytes) goes on the device's
+            # data-bearing UART; the 20-byte trailer always lands on
+            # the control UART. This is the same two-write pattern as
+            # `IGPDeviceManager.send` + `send$lambda-135` in the smali.
+            await client._transport.send(send_data, channel=data_channel)
+            await client._transport.send(confirm_data, channel="control")
+
+            response = await asyncio.wait_for(queue.get(), timeout=timeout)
+            last_status = response.frame.status
+            _LOG.debug(
+                "chunk %d/%d (endType=%d): status=%d (%s)",
+                i + 1,
+                n,
+                end_type,
+                last_status,
+                _status_name(last_status),
+            )
+            if last_status not in (_STATUS_OK, _STATUS_DONE_EARLY):
+                raise RouteUploadError(last_status, i, n)
+            if last_status == _STATUS_DONE_EARLY:
+                _LOG.debug("device returned status=4 after chunk %d/%d; stopping", i + 1, n)
+                break
+
+        if send_file_use:
+            # FILE_USE commit: tells the device to switch to the
+            # newly uploaded route. The app issues this in
+            # `setRoutePlanFile` after every successful
+            # `sendRoutePlanFile`.
+            use_pb = _build_file_use_pb(file_id=file_id, file_extension=file_extension)
+            use_header = _build_file_use_header(use_pb)
+            await client._transport.send(use_pb, channel=data_channel)
+            await client._transport.send(use_header, channel="control")
+            response = await asyncio.wait_for(queue.get(), timeout=timeout)
+            use_status = response.frame.status
+            _LOG.debug("FILE_USE: status=%d (%s)", use_status, _status_name(use_status))
+            last_status = use_status
     finally:
-        with contextlib.suppress(Exception):
-            await sub.aclose()  # type: ignore[attr-defined]
-    return response.frame.status
+        await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN, queue)
+    return last_status
+
+
+# ---- FILE_OPERATION upload path -------------------------------------
+#
+# The Android app uploads CNX route bytes via the FILE_OPERATION
+# service (21), NOT the ROUTE_PLAN service (7). Mirror of
+# ``IGPDeviceManager.sendRoutePlanFileSingleChannel`` (smali 3753-).
+# This was verified against a live BSC200 (firmware 2024-05-14) by
+# btsnoop capture + replay — see docs/PROTOCOL.md §7.1.2. Without it
+# the BSC200 returns ``DataError`` for every chunk on the ROUTE_PLAN
+# path, regardless of file content.
+
+# common_pb2 enum mirrors.
+_SERVICE_FILE_OPERATION: Final[int] = common_pb2.enum_SERVICE_TYPE_INDEX_FILE_OPERATION
+_SERVICE_OPERATE_TYPE_ADD: Final[int] = common_pb2.enum_SERVICE_OPERATE_TYPE_ADD
+
+# `general_file_operation.file_type` enum values (from
+# reference/general_file_operation.proto). Only the values we use are
+# named here; the device accepts more (TRAINING, MAP, THEME, FIRMWARE,
+# LANGUAGE, AGPS, ROUTE_BOOK).
+FILE_OP_TYPE_ROUTE_PLAN: Final[int] = 2
+
+# Magic byte at offset 3 of the 20-byte head for a chunked file
+# upload — without this, the device treats the payload as a
+# standard PbFrame request and rejects it. Source:
+# `sendRoutePlanFileSingleChannel` smali line 3807 (`const/16 v2,
+# -86` → 0xaa, written into the byte that BaseFactory calls
+# ``byte3``).
+_FILE_OP_TAG_UPLOAD: Final[int] = 0xAA
+
+
+def _build_general_file_operation_pb(
+    *,
+    file_type: int,
+    file_size: int,
+    file_id: int,
+    file_name: str,
+    file_extension: str,
+) -> bytes:
+    """Hand-roll the ``general_file_operation`` protobuf.
+
+    The generated module isn't checked in (the ``reference/`` proto
+    is consumed by ``gen-proto`` but ``general_file_operation`` was
+    only discovered after we already shipped the route_plan path);
+    hand-encoding keeps the new path self-contained until the
+    schema gets the protoc treatment in a follow-up.
+    """
+
+    def varint(v: int) -> bytes:
+        out = bytearray()
+        while v > 0x7F:
+            out.append(0x80 | (v & 0x7F))
+            v >>= 7
+        out.append(v & 0x7F)
+        return bytes(out)
+
+    def field_varint(field: int, v: int) -> bytes:
+        return bytes([(field << 3) | 0]) + varint(v)
+
+    def field_str(field: int, s: str) -> bytes:
+        b = s.encode("utf-8")
+        return bytes([(field << 3) | 2]) + varint(len(b)) + b
+
+    return (
+        field_varint(1, _SERVICE_FILE_OPERATION)
+        + field_varint(2, _SERVICE_OPERATE_TYPE_ADD)
+        + field_varint(3, file_type)
+        + field_varint(4, file_size)
+        + field_varint(5, file_id)
+        + field_str(6, file_name)
+        + field_str(7, file_extension)
+    )
+
+
+def _build_file_operation_head(*, operate: int) -> bytes:
+    """Build the 20-byte head for a chunked FILE_OPERATION upload.
+
+    Layout (matches ``BaseFactory.confirmCommandByteArray()`` with
+    ``mainServiceType=FILE_OPERATION``, ``mainCommandByte=ADD``,
+    ``getData()`` empty, then byte 3 patched to 0xaa by
+    ``sendRoutePlanFileSingleChannel``):
+
+      [0] 0x01 (TYPE_PB)
+      [1] 0x15 (FILE_OPERATION)
+      [2] 0xff (sub_service)
+      [3] 0xaa (file_tag - upload magic)
+      [4] op  (ADD = 3)
+      [5] 0xff (sub_operation)
+      [6] 0xff (reserved)
+      [7-8] 0x0000 (size — getData() is empty here; the actual
+                    size lives in the 4-byte BE prefix that
+                    follows this 20-byte head on the wire)
+      [9] 0x00 (CRC8 of empty payload)
+      [10] 0x01 (END_TYPE_PB)
+      [11-18] 0xff
+      [19] CRC8(bytes 0..18)
+    """
+    head = bytearray(20)
+    head[0] = 0x01
+    head[1] = _SERVICE_FILE_OPERATION & 0xFF
+    head[2] = 0xFF
+    head[3] = _FILE_OP_TAG_UPLOAD
+    head[4] = operate & 0xFF
+    head[5] = 0xFF
+    head[6] = 0xFF
+    head[7] = 0x00
+    head[8] = 0x00
+    head[9] = 0x00
+    head[10] = 0x01
+    for off in range(11, 19):
+        head[off] = 0xFF
+    head[19] = framing.crc8(bytes(head[:19]))
+    return bytes(head)
+
+
+async def upload_general_file(
+    client: IgpsportClient,
+    file_bytes: bytes,
+    *,
+    file_type: int,
+    file_id: int,
+    file_name: str,
+    file_extension: str,
+    chunk_size: int | None = None,
+    timeout: float = 30.0,
+) -> int:
+    """Upload *file_bytes* via the FILE_OPERATION ADD path.
+
+    Used by the BSC200 (and other devices) for CNX route uploads — the
+    Android app calls this ``sendRoutePlanFileSingleChannel``. The full
+    payload (head + size prefix + metadata protobuf + file bytes) is
+    written in MTU-sized chunks to the "fourth" characteristic
+    (``…-6e``). The device sends one notification on the same service
+    channel after processing — that notification's ``status`` byte is
+    the return value (``0 = Success``).
+
+    *chunk_size* defaults to ``transport MTU - 3``. With BlueZ-direct
+    + MTU 247 that's 244 bytes per chunk; with bleak's default MTU
+    23 it's 20.
+
+    Raises :class:`RouteUploadError` if the device returns a non-zero
+    status. Raises :class:`asyncio.TimeoutError` if no notification
+    arrives within *timeout*.
+    """
+    head = _build_file_operation_head(operate=_SERVICE_OPERATE_TYPE_ADD)
+    pb = _build_general_file_operation_pb(
+        file_type=file_type,
+        file_size=len(file_bytes),
+        file_id=file_id,
+        file_name=file_name,
+        file_extension=file_extension,
+    )
+    payload = head + struct.pack(">I", len(pb)) + pb + file_bytes
+    if chunk_size is None:
+        # Subtract 3 (ATT op + handle) to land each write in one
+        # ATT packet. The transport may further split if the MTU is
+        # smaller than the chunk, but we send what the device parser
+        # expects.
+        mtu = client._transport.mtu if hasattr(client._transport, "mtu") else 23
+        if callable(mtu):
+            mtu = mtu()
+        chunk_size = max(int(mtu) - 3, 20)
+
+    queue = await client.open_subscription(_SERVICE_FILE_OPERATION)
+    try:
+        n_writes = 0
+        for off in range(0, len(payload), chunk_size):
+            await client._transport.send(payload[off : off + chunk_size], channel="fourth")
+            n_writes += 1
+        _LOG.debug(
+            "FILE_OPERATION ADD upload: %d bytes payload in %d writes (chunk=%d)",
+            len(payload),
+            n_writes,
+            chunk_size,
+        )
+        response = await asyncio.wait_for(queue.get(), timeout=timeout)
+    finally:
+        await client.close_subscription(_SERVICE_FILE_OPERATION, queue)
+
+    status = response.frame.status
+    _LOG.debug(
+        "FILE_OPERATION ADD: status=%d (%s)",
+        status,
+        _status_name(status),
+    )
+    if status not in (_STATUS_OK, _STATUS_DONE_EARLY):
+        raise RouteUploadError(status, 0, n_writes)
+    return status

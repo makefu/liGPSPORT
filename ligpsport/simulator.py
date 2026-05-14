@@ -36,10 +36,11 @@ from .proto import (
     cycling_data_pb2,
     dev_status_pb2,
     dev_ver_info_pb2,
+    route_plan_pb2,
     sensor_pb2,
     user_config_pb2,
 )
-from .transport import Transport, TransportClosed
+from .transport import Channel, LoopbackTransport, Transport, TransportClosed
 
 _LOG = logging.getLogger(__name__)
 
@@ -58,6 +59,19 @@ class SimulatedRideFile:
     file_size: int
     user_id: str = ""
     device_id: str = ""
+
+
+@dataclasses.dataclass(slots=True)
+class UploadedRouteFile:
+    """An accumulated route file received via a multi-chunk upload."""
+
+    file_id: int
+    file_type: int
+    name: str
+    extension: str
+    total_distance: int
+    content: bytes
+    end_types: list[int]
 
 
 @dataclasses.dataclass(slots=True)
@@ -125,6 +139,14 @@ class SimulatorState:
 
     # Paired sensors (SENSOR service).
     sensors: list[SimulatedSensor] = dataclasses.field(default_factory=list)
+
+    # Completed uploads from `upload_route_plan`. Each entry is the
+    # reassembled file plus its decoded metadata.
+    uploaded_routes: list[UploadedRouteFile] = dataclasses.field(default_factory=list)
+
+    # file_id of the route most recently committed via FILE_USE (the
+    # commit step that mirrors `setRoutePlanFile` in the smali).
+    active_route_id: int | None = None
 
     # The simulator records every received frame for test assertions.
     received: list[framing.Frame] = dataclasses.field(default_factory=list)
@@ -266,6 +288,12 @@ class Simulator:
         self._transport = transport
         self.state = state if state is not None else SimulatorState()
         self._task: asyncio.Task[None] | None = None
+        # Pending data-channel chunks waiting for their matching
+        # control-channel trailer. Indexed by the channel they
+        # arrived on so we don't cross the streams.
+        self._pending_chunk: dict[Channel, bytes] = {}
+        # In-progress route-plan upload; finalised on end_type=3.
+        self._in_progress_route: UploadedRouteFile | None = None
 
     async def __aenter__(self) -> Simulator:
         self._task = asyncio.create_task(self._serve(), name="ligpsport-simulator")
@@ -291,15 +319,50 @@ class Simulator:
 
     async def _serve(self) -> None:
         try:
-            async for raw in self._transport.frames():
-                await self._handle_one(raw)
+            while True:
+                channel, raw = await self._next_inbound()
+                await self._handle_one(channel, raw)
         except TransportClosed:
             _LOG.debug("simulator transport closed; exiting")
         except Exception:
             _LOG.exception("simulator crashed")
             raise
 
-    async def _handle_one(self, raw: bytes) -> None:
+    async def _next_inbound(self) -> tuple[Channel, bytes]:
+        """Read the next ``(channel, bytes)`` tuple from the transport.
+
+        Falls back to plain :meth:`Transport.receive` (channel
+        defaulted to ``"control"``) when running against a transport
+        that doesn't expose channel info — keeps the simulator usable
+        with any future transport that doesn't model channels.
+        """
+        if isinstance(self._transport, LoopbackTransport):
+            return await self._transport.receive_with_channel()
+        return ("control", await self._transport.receive())
+
+    async def _handle_one(self, channel: Channel, raw: bytes) -> None:
+        # Multi-channel uploads land here as raw chunk bytes on data /
+        # fourth, paired with a 20-byte trailer on control. Buffer the
+        # chunk until its trailer arrives.
+        if channel in ("data", "fourth"):
+            self._pending_chunk[channel] = raw
+            return
+        # Control-channel writes are usually a full PbFrame. The
+        # route-upload trailer is also written here, but it's an
+        # *un-paired* 20-byte header whose payload_size points at the
+        # raw protobuf already buffered on data/fourth. Disambiguate
+        # by length plus the buffered-chunk presence.
+        if len(raw) == framing.HEADER_SIZE and self._pending_chunk:
+            for buffered_channel, chunk in list(self._pending_chunk.items()):
+                match = self._match_route_chunk(chunk, raw)
+                if match is not None:
+                    op, end_type = match
+                    self._pending_chunk.pop(buffered_channel, None)
+                    if op == route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE:
+                        await self._handle_route_use(chunk)
+                    else:
+                        await self._handle_route_upload_chunk(chunk, end_type)
+                    return
         try:
             frame = framing.parse_frame(raw)
         except framing.FrameError as exc:
@@ -325,3 +388,100 @@ class Simulator:
             payload=payload,
         )
         await self._transport.send(framing.build_frame(out_frame))
+
+    @staticmethod
+    def _match_route_chunk(chunk: bytes, header: bytes) -> tuple[int, int] | None:
+        """Return ``(operation, end_type)`` if ``(chunk, header)`` is a route trailer.
+
+        Returns None when the header isn't a recognized route-plan
+        trailer; the caller then dispatches the header through the
+        normal frame path. Validates the trailer is well-formed (type,
+        service, declared size, payload CRC, header CRC). Recognized
+        operations: ``FILE_SEND`` (chunked upload) and ``FILE_USE``
+        (single-frame commit after upload).
+        """
+        if header[framing.HDR_TYPE] != framing.TYPE_PB:
+            return None
+        if header[framing.HDR_SERVICE] != common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN:
+            return None
+        op = header[framing.HDR_OPERATION]
+        if op not in (
+            route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_SEND,
+            route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE,
+        ):
+            return None
+        declared = (header[framing.HDR_PAYLOAD_SIZE] << 8) | header[framing.HDR_PAYLOAD_SIZE + 1]
+        if declared != len(chunk):
+            return None
+        if framing.crc8(chunk) != header[framing.HDR_PAYLOAD_CRC]:
+            _LOG.warning("simulator: route-upload chunk failed payload CRC")
+            return None
+        if framing.crc8(header[: framing.HDR_HEADER_CRC]) != header[framing.HDR_HEADER_CRC]:
+            _LOG.warning("simulator: route-upload trailer failed header CRC")
+            return None
+        return (op, header[framing.HDR_END_MARKER])
+
+    async def _handle_route_upload_chunk(self, chunk: bytes, end_type: int) -> None:
+        """Append a route-upload chunk and ACK it.
+
+        Mirrors `checkSendRoutePlanFileIsReceiveFinish` in the smali:
+        every chunk gets a ConfirmFrame with status=0. We don't model
+        the progress / done-early status codes — they are device-side
+        bookkeeping the client already treats as "continue" / "stop".
+
+        Chunks accumulate in :attr:`_in_progress_route` until a chunk
+        with ``end_type=3`` arrives; that one finalises the entry and
+        appends it to :attr:`SimulatorState.uploaded_routes`.
+        """
+        msg = route_plan_pb2.route_plan_data_msg()
+        msg.ParseFromString(chunk)
+        if self._in_progress_route is None:
+            info = msg.route_plan_info_msg[0] if msg.route_plan_info_msg else None
+            extension = ""
+            if msg.line_id:
+                parts = msg.line_id[0].rsplit(".", 1)
+                if len(parts) == 2:
+                    extension = parts[1]
+            self._in_progress_route = UploadedRouteFile(
+                file_id=info.id if info is not None else 0,
+                file_type=info.file_type if info is not None else 0,
+                name=info.name if info is not None else "",
+                extension=extension,
+                total_distance=info.total_distance if info is not None else 0,
+                content=b"",
+                end_types=[],
+            )
+        self._in_progress_route.content += msg.file_content
+        self._in_progress_route.end_types.append(end_type)
+        if end_type == 3:
+            self.state.uploaded_routes.append(self._in_progress_route)
+            self._in_progress_route = None
+        ack = framing.build_frame(
+            framing.Frame(
+                type=framing.TYPE_CONFIRM,
+                service=common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN,
+                operation=route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_SEND,
+                status=0,
+            )
+        )
+        await self._transport.send(ack)
+
+    async def _handle_route_use(self, chunk: bytes) -> None:
+        """Handle a FILE_USE commit. Records the file_id used and acks 0."""
+        msg = route_plan_pb2.route_plan_data_msg()
+        msg.ParseFromString(chunk)
+        info = msg.route_plan_info_msg[0] if msg.route_plan_info_msg else None
+        used_id = info.id if info is not None else 0
+        for entry in self.state.uploaded_routes:
+            if entry.file_id == used_id:
+                self.state.active_route_id = used_id
+                break
+        ack = framing.build_frame(
+            framing.Frame(
+                type=framing.TYPE_CONFIRM,
+                service=common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN,
+                operation=route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE,
+                status=0,
+            )
+        )
+        await self._transport.send(ack)
