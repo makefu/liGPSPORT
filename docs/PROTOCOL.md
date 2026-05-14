@@ -802,3 +802,46 @@ Use `MOCK_LOCATION --ef lat --ef lon` first if the test rig has no
 real GPS fix. `PLAN_AND_UPLOAD` / `UPLOAD` lines gain
 `seed_lat=` + `seed_lon=` when the piggybacked injection succeeds;
 absence means the step was skipped (no fix or device rejection).
+
+## 14. Locale gotcha for CNX coordinate emitters
+
+Observed in the wild (May 2026): on a `de_DE`-locale Android phone
+the BSC200 displayed a "distance to goal" of 693 km for a route
+that's actually 9 km long.
+
+Root cause: the CNX `<Tracks>` field uses **commas as the
+field-separator within a record** (e.g. `48.7561529,9.2263629,55241;`
+for the absolute lat/lon/elevation of the first track point). The
+absolute lat/lon at record 0 therefore **must** be formatted with a
+period as its decimal separator. Locale-aware formatters that pick
+a comma decimal break that contract — the first record becomes
+`48,7561529,9,2263629,55241`, the BSC200's parser reads five
+comma-separated tokens instead of three, and every subsequent
+record mis-aligns from there.
+
+Concretely per language:
+
+* **Python** (`ligpsport.cnx._format_coord`) is safe by default:
+  f-strings and `%`-format always use `.` regardless of
+  `LC_NUMERIC` — only the `:n` format spec consults
+  `locale.localeconv`, and we don't use it. The docstring on
+  `_format_coord` calls this out for porters.
+* **Kotlin / Java** (`ligpsport-android`'s `CnxEncoder.formatCoord`)
+  is **not** safe by default: `"%.7f".format(v)` and
+  `String.format("%.7f", v)` honour `Locale.getDefault()`. Pin
+  the locale explicitly:
+  ```kotlin
+  String.format(Locale.ROOT, "%.7f", v)
+  ```
+  Tracked by the `coordinates_use_period_decimal_under_de_de_locale`
+  regression test in `CnxEncoderTest`.
+* **C# / .NET** has the same trap: pin
+  `CultureInfo.InvariantCulture` on every `ToString("F7")`.
+* **Go** is safe (`strconv.FormatFloat` is locale-independent).
+* **JavaScript** is safe (`Number.toFixed` always uses `.`); but
+  `Intl.NumberFormat` and `Number.toLocaleString` are not.
+
+Same rule as JSON: the file format is locale-neutral, so the
+*emitter* must be too. The captured cloud CNX
+(`tests/fixtures/cnx_cloud_capture.cnx`) is the byte-level
+reference — diff against it after any change to the encoder.
