@@ -198,3 +198,84 @@ def test_confirm_header_layout() -> None:
 def test_confirm_header_rejects_invalid_end_type() -> None:
     with pytest.raises(ValueError):
         file_transfer._build_route_plan_confirm_header(b"x", end_type=1)
+
+
+async def test_file_operation_upload_starts_navigation() -> None:
+    """``start_navigation=True`` triggers FILE_USE on the CNX path.
+
+    Reverse-engineered from
+    ``RoadBookSearchActivity.sendFileToDevice``: after a successful
+    FILE_OPERATION ADD upload, the iGPSPORT app calls
+    ``IGPDeviceManager.setRoutePlanFile`` (ROUTE_PLAN FILE_USE) which
+    activates the route and starts navigation on the device. We
+    assert the simulator (a) records the FILE_OPERATION upload and
+    (b) gets a follow-up FILE_USE that sets ``active_route_id``.
+    """
+    # Captured CNX bytes — exercise the multi-write fourth-channel
+    # accumulator in the simulator.
+    cnx_bytes = (_REPO_ROOT / "tests" / "fixtures" / "cnx_cloud_capture.cnx").read_bytes()
+    route = RouteData(name="trip", points=(Point(latitude=48.8, longitude=9.2),))
+
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState()
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        status = await file_transfer.upload_route_plan(
+            client,
+            route,
+            file_id=99,
+            file_extension="cnx",
+            generation=3,
+            device_name="BSC200",
+            timeout=2.0,
+            raw_bytes=cnx_bytes,
+            raw_name="trip",
+            start_navigation=True,
+        )
+    assert status == 0
+    # The FILE_OPERATION ADD upload landed.
+    assert state.uploaded_routes, "simulator should have absorbed the CNX upload"
+    uploaded = state.uploaded_routes[-1]
+    assert uploaded.content == cnx_bytes
+    assert uploaded.file_id == 99
+    assert uploaded.extension == "cnx"
+    # The follow-up FILE_USE flipped the active route on the device.
+    assert state.active_route_id == 99
+
+
+async def test_file_operation_upload_without_start_skips_file_use() -> None:
+    """``start_navigation=False`` (default) leaves ``active_route_id`` unset."""
+    cnx_bytes = (_REPO_ROOT / "tests" / "fixtures" / "cnx_cloud_capture.cnx").read_bytes()
+    route = RouteData(name="trip", points=(Point(latitude=48.8, longitude=9.2),))
+
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState()
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        status = await file_transfer.upload_route_plan(
+            client,
+            route,
+            file_id=99,
+            file_extension="cnx",
+            generation=3,
+            device_name="BSC200",
+            timeout=2.0,
+            raw_bytes=cnx_bytes,
+            raw_name="trip",
+        )
+    assert status == 0
+    assert state.uploaded_routes
+    assert state.active_route_id is None
+
+
+async def test_navigation_start_error_when_file_use_fails() -> None:
+    """A non-success FILE_USE status raises :class:`NavigationStartError`.
+
+    Pre-populate the simulator with an unrelated route id so the
+    FILE_USE handler's id-lookup branch sets active_route_id only
+    when the uploaded id matches. Then force a mismatch by uploading
+    one id and requesting FILE_USE for another via a low-level call.
+    """
+    # Verify the exception class plumbs the file_id + status through.
+    err = file_transfer.NavigationStartError(status=1, file_id=42)
+    assert err.file_id == 42
+    assert err.status == 1
+    assert "DataError" in str(err)

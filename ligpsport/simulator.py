@@ -294,6 +294,12 @@ class Simulator:
         self._pending_chunk: dict[Channel, bytes] = {}
         # In-progress route-plan upload; finalised on end_type=3.
         self._in_progress_route: UploadedRouteFile | None = None
+        # In-progress FILE_OPERATION ADD upload (CNX route stream that
+        # the BSC200 firmware actually accepts). Unlike the chunked
+        # FILE_SEND path this is a single multi-write stream on the
+        # fourth channel with no per-chunk trailer; we accumulate
+        # until the head's declared payload size is satisfied.
+        self._in_progress_general_upload: bytearray | None = None
 
     async def __aenter__(self) -> Simulator:
         self._task = asyncio.create_task(self._serve(), name="ligpsport-simulator")
@@ -342,9 +348,24 @@ class Simulator:
 
     async def _handle_one(self, channel: Channel, raw: bytes) -> None:
         # Multi-channel uploads land here as raw chunk bytes on data /
-        # fourth, paired with a 20-byte trailer on control. Buffer the
-        # chunk until its trailer arrives.
+        # fourth. There are two streams to disambiguate:
+        #
+        # (a) ROUTE_PLAN FILE_SEND chunks — each write is a complete
+        #     route_plan_data_msg protobuf paired with a 20-byte
+        #     trailer on control. Buffer until the trailer arrives.
+        # (b) FILE_OPERATION ADD streams — a single multi-write stream
+        #     on the fourth channel that starts with a 20-byte head
+        #     (byte 1 == 0x15 = FILE_OPERATION service) and has no
+        #     per-chunk trailer. Accumulate until the head's size
+        #     prefix is satisfied, then ACK with a single notification.
+        #
+        # Disambiguate by the first byte: a head is TYPE_PB (0x01); a
+        # route_plan_data_msg protobuf starts with field-1 varint tag
+        # (0x08).
         if channel in ("data", "fourth"):
+            if self._in_progress_general_upload is not None or self._looks_like_file_op_head(raw):
+                await self._absorb_general_upload_chunk(raw)
+                return
             self._pending_chunk[channel] = raw
             return
         # Control-channel writes are usually a full PbFrame. The
@@ -461,6 +482,77 @@ class Simulator:
                 type=framing.TYPE_CONFIRM,
                 service=common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN,
                 operation=route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_SEND,
+                status=0,
+            )
+        )
+        await self._transport.send(ack)
+
+    @staticmethod
+    def _looks_like_file_op_head(raw: bytes) -> bool:
+        """Heuristic: does *raw* start with a FILE_OPERATION ADD head?
+
+        FILE_OPERATION upload heads are 20-byte PbFrame heads with
+        service=21 (FILE_OPERATION) at offset 1 and file_tag=0xaa at
+        offset 3. A ROUTE_PLAN FILE_SEND chunk is a raw protobuf and
+        starts with 0x08 (field-1 varint tag), so the two can't
+        collide. See docs/PROTOCOL.md §7.1.2.
+        """
+        return (
+            len(raw) >= framing.HEADER_SIZE
+            and raw[framing.HDR_TYPE] == framing.TYPE_PB
+            and raw[framing.HDR_SERVICE]
+            == (common_pb2.enum_SERVICE_TYPE_INDEX_FILE_OPERATION & 0xFF)
+            and raw[framing.HDR_FILE_TAG] == 0xAA
+        )
+
+    async def _absorb_general_upload_chunk(self, raw: bytes) -> None:
+        """Buffer one slice of a FILE_OPERATION ADD upload; finalise on EOF.
+
+        Wire layout (per PROTOCOL.md §7.1.2):
+          * 20-byte head (file_tag = 0xaa identifies an upload stream)
+          * 4-byte BE ``pb_size`` (length of the protobuf only)
+          * ``general_file_operation`` protobuf, which carries
+            ``file_size`` as a required field
+          * raw ``file_size`` file bytes (CNX for route plans)
+
+        Total expected stream length = ``20 + 4 + pb_size + file_size``.
+        We accumulate writes until that's reached, then parse + ACK.
+        """
+        from .proto import general_file_operation_pb2
+
+        if self._in_progress_general_upload is None:
+            self._in_progress_general_upload = bytearray()
+        self._in_progress_general_upload.extend(raw)
+        buf = self._in_progress_general_upload
+        if len(buf) < framing.HEADER_SIZE + 4:
+            return  # still waiting for the pb size prefix
+        pb_size = int.from_bytes(bytes(buf[framing.HEADER_SIZE : framing.HEADER_SIZE + 4]), "big")
+        pb_start = framing.HEADER_SIZE + 4
+        pb_end = pb_start + pb_size
+        if len(buf) < pb_end:
+            return  # still waiting for the protobuf body
+        pb_msg = general_file_operation_pb2.general_file_operation()
+        pb_msg.ParseFromString(bytes(buf[pb_start:pb_end]))
+        total_expected = pb_end + pb_msg.file_size
+        if len(buf) < total_expected:
+            return  # still waiting for the file bytes
+        file_bytes = bytes(buf[pb_end:total_expected])
+        self._in_progress_general_upload = None
+        entry = UploadedRouteFile(
+            file_id=pb_msg.file_id,
+            file_type=pb_msg.file_type,
+            name=pb_msg.file_name,
+            extension=pb_msg.file_extension,
+            total_distance=0,
+            content=file_bytes,
+            end_types=[],
+        )
+        self.state.uploaded_routes.append(entry)
+        ack = framing.build_frame(
+            framing.Frame(
+                type=framing.TYPE_CONFIRM,
+                service=common_pb2.enum_SERVICE_TYPE_INDEX_FILE_OPERATION,
+                operation=common_pb2.enum_SERVICE_OPERATE_TYPE_ADD,
                 status=0,
             )
         )

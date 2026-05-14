@@ -659,6 +659,87 @@ authenticated user session) but is a clean follow-on.
 against the in-tree simulator; the BSC200 has no recorded rides on
 hand to verify against the live device).
 
+### 7.2 Starting navigation — ROUTE_PLAN FILE_USE
+
+Uploading a route puts the file on the device's filesystem but does
+**not** activate it. To make the device switch to the new route and
+enter navigation mode, the iGPSPORT Android app issues a separate
+``ROUTE_PLAN FILE_USE`` (operate_type=5) after the upload. The smali
+hook is ``IGPDeviceManager.setRoutePlanFile(id, fileType)`` at
+``c4 line 27391``; the activity-level caller is
+``RoadBookSearchActivity.useRoutePlan`` (and a paired ``sendFileToDevice``
+flow that wraps upload + FILE_USE behind a single "send and use"
+button). The app waits ~5 s after a successful FILE_USE — long enough
+for the on-device UI to transition into the navigation screen — then
+dismisses its dialog.
+
+#### Wire format
+
+FILE_USE is **a single ROUTE_PLAN frame**, not a chunked stream, but
+the multi-channel split mirrors the FILE_SEND pattern.
+
+``route_plan_data_msg`` protobuf body:
+
+| Field | Value |
+|-------|-------|
+| ``service_type`` (1) | ``SERVICE_TYPE_INDEX_ROUTE_PLAN`` (7) |
+| ``route_plan_operate_type`` (2) | ``FILE_USE`` (5) |
+| ``line_id`` (3) | one entry: ``"<file_id>.<ext>"`` (e.g. ``"99.cnx"``) |
+| ``route_plan_info_msg`` (5) | one entry with ``id = file_id``, ``file_type = enum_ROUTE_PLAN_FILE_TYPE_CNX`` |
+
+20-byte head paired with the body:
+
+| Offset | Value | Meaning |
+|-------:|-------|---------|
+| 0 | ``0x01`` | TYPE_PB |
+| 1 | ``0x07`` | ROUTE_PLAN service |
+| 2 | ``0xFF`` | sub_service |
+| 3 | ``0xFF`` | file_tag (no upload-tag magic — this is not a chunked stream) |
+| 4 | ``0x05`` | operation = FILE_USE |
+| 5–6 | ``0xFF`` | sub_operation, reserved |
+| 7–8 | BE size | length of the protobuf body |
+| 9 | CRC8 | over the protobuf body |
+| 10 | ``0x01`` | END_TYPE_PB (no chunked-stream endType byte for this op) |
+| 11–18 | ``0xFF`` | reserved |
+| 19 | CRC8 | over bytes 0..18 |
+
+Channel split (generation-aware, per ``setRoutePlanFile`` smali):
+
+| Device generation | Body channel | Header channel |
+|-------------------|--------------|----------------|
+| gen < 3 (legacy) | ``data`` (``…-9e``) | ``control`` (``…-8e``) |
+| gen ≥ 3 (BSC200, BSC300, iGS320/520/630) | ``fourth`` (``…-6e``) | ``control`` (``…-8e``) |
+
+The device replies with a single ``ConfirmFrame`` on the ROUTE_PLAN
+service. The status byte at offset 7 is the same
+``DeviceReturnStatus`` ordinal used by FILE_SEND — ``0 = Success``,
+anything else is a refusal (``1 = DataError``, ``16 = NavigationRouteDoesNotExist``,
+etc. — see §7 status table).
+
+#### Library binding
+
+`ligpsport.file_transfer.upload_route_plan(..., start_navigation=True)`
+issues FILE_USE automatically after a successful upload on either
+path (FILE_OPERATION ADD for CNX, ROUTE_PLAN FILE_SEND for legacy
+chunked formats). The CLI exposes this as a trailing ``start``
+token:
+
+```sh
+ligpsport command --name bike upload-route trip.gpx 1 start
+ligpsport command --name bike upload-route trip.cnx 7 start
+```
+
+Without ``start`` the route is loaded but the user must pick it
+manually from the on-device route list. A non-zero FILE_USE status
+raises :class:`ligpsport.file_transfer.NavigationStartError`; the
+upload itself is still considered successful (the file remains on
+the device for a later retry or manual activation).
+
+There is no inverse "stop navigation" command. To switch routes,
+issue another FILE_USE with the new file id; to clear an active
+navigation, the on-device UI is the only path (no ``FILE_UNUSE``
+operation exists in the proto).
+
 ## 8. Destructive operations
 
 The following ``(service, operation)`` tuples alter persistent state

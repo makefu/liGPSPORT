@@ -30,6 +30,7 @@ spec).
 | BlueZ-direct backend with MTU negotiation     | yes (`--backend bluez`) |
 | Route upload — wire protocol                  | yes — FILE_OPERATION ADD (smali-verified + btsnoop-captured) |
 | Route upload — file format                    | local GPX → CNX conversion (stdlib only, no cloud round-trip); **live-verified on BSC200 firmware 2024-05-14** |
+| Start navigation after upload (`FILE_USE`)    | yes — pass `start` to `upload-route` |
 | Map / theme upload                            | not yet (wire format known; pending btsnoop capture) |
 | Firmware upgrade                              | not yet     |
 | Live tracking (REAL_TIME_TRACE)               | not yet     |

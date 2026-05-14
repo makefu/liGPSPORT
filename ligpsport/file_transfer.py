@@ -190,6 +190,26 @@ class RouteUploadError(RuntimeError):
         self.total_chunks = total_chunks
 
 
+class NavigationStartError(RuntimeError):
+    """Raised when the device refuses a FILE_USE (start-navigation) request.
+
+    The upload itself succeeded — the device has the file — but the
+    follow-up ``ROUTE_PLAN FILE_USE`` returned a non-success
+    ``DeviceReturnStatus``. The route stays on the device's file list
+    and can be activated later (e.g. via the on-device UI or a
+    retried FILE_USE). PROTOCOL.md §7.2 has the wire-level details.
+    """
+
+    def __init__(self, status: int, file_id: int):
+        super().__init__(
+            f"device refused FILE_USE for file_id={file_id} with "
+            f"status={status} ({_status_name(status)})"
+        )
+        self.status = status
+        self.status_name = _status_name(status)
+        self.file_id = file_id
+
+
 async def download_cycling_data(
     client: IgpsportClient,
     *,
@@ -403,6 +423,58 @@ def _build_file_use_header(send_data: bytes) -> bytes:
     return bytes(header)
 
 
+async def _send_file_use(
+    client: IgpsportClient,
+    *,
+    file_id: int,
+    file_extension: str,
+    generation: int,
+    timeout: float,
+    existing_queue: asyncio.Queue[object] | None = None,
+) -> int:
+    """Send a ``ROUTE_PLAN FILE_USE`` and return the device's status byte.
+
+    Mirrors :samp:`IGPDeviceManager.setRoutePlanFile` (smali line
+    27391). After a successful upload, FILE_USE is what tells the
+    device to switch its active route and enter navigation mode —
+    the iGPSPORT Android app issues this from
+    ``RoadBookSearchActivity.useRoutePlan`` (CNX path) and from the
+    ``sendFileToDevice`` flow (FILE_OPERATION path) whenever the user
+    chose "send and use", and confirms success by toasting
+    ``使用线路 status = 0``.
+
+    *generation* selects the data channel: ``>= 3`` writes the
+    protobuf body to ``"fourth"`` (``…-6e``), otherwise ``"data"``
+    (``…-9e``). The 20-byte header always goes on ``"control"``.
+
+    *existing_queue* lets the chunked-upload path reuse its already-
+    open ROUTE_PLAN subscription so the FILE_USE reply doesn't race a
+    fresh subscriber registration.
+
+    Returns the device's ``DeviceReturnStatus`` byte (0 = Success).
+    Callers decide whether to raise :class:`NavigationStartError`.
+    """
+    data_channel: Channel = "fourth" if generation >= 3 else "data"
+    use_pb = _build_file_use_pb(file_id=file_id, file_extension=file_extension)
+    use_header = _build_file_use_header(use_pb)
+    if existing_queue is None:
+        queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN)
+        owns_queue = True
+    else:
+        queue = existing_queue  # type: ignore[assignment]
+        owns_queue = False
+    try:
+        await client._transport.send(use_pb, channel=data_channel)
+        await client._transport.send(use_header, channel="control")
+        response = await asyncio.wait_for(queue.get(), timeout=timeout)
+    finally:
+        if owns_queue:
+            await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN, queue)
+    status = response.frame.status  # type: ignore[attr-defined]
+    _LOG.debug("FILE_USE: status=%d (%s)", status, _status_name(status))
+    return int(status)
+
+
 async def upload_route_plan(
     client: IgpsportClient,
     route: RouteData,
@@ -414,6 +486,7 @@ async def upload_route_plan(
     device_name: str | None = None,
     timeout: float = 30.0,
     send_file_use: bool = True,
+    start_navigation: bool = False,
     raw_bytes: bytes | None = None,
     raw_name: str | None = None,
     waypoints: Sequence[Waypoint] | None = None,
@@ -432,9 +505,21 @@ async def upload_route_plan(
     40 bytes if unknown).
 
     *send_file_use* controls whether a follow-up ``FILE_USE`` command
-    is sent after the last chunk (mirrors
-    ``setRoutePlanFile`` in the smali — the app always issues this to
-    commit the upload). Default: True.
+    is sent after the last chunk of the **chunked** (FILE_SEND) path
+    (mirrors ``setRoutePlanFile`` in the smali — the app always
+    issues this to commit the upload). Default: True. Has no effect
+    on the FILE_OPERATION CNX path; use *start_navigation* for that.
+
+    *start_navigation*, when True, issues ``FILE_USE`` after a
+    successful upload on **either** path (chunked or
+    FILE_OPERATION). This is what tells the device to switch its
+    active route and enter navigation mode — :class:`NavigationStartError`
+    is raised if the device refuses. The upload itself is still
+    considered successful when the FILE_USE step fails. Default:
+    False (the iGPSPORT app makes nav start opt-in too — its
+    ``sendOnly`` flag in ``RoadBookSearchActivity.sendFileToDevice``
+    suppresses the FILE_USE call when the user only wants to push a
+    file without auto-navigating). See PROTOCOL.md §7.2.
 
     *raw_bytes* and *raw_name*, if given, bypass the serialisers and
     upload the bytes verbatim. Use this for pre-baked payloads (e.g.
@@ -473,6 +558,8 @@ async def upload_route_plan(
             file_name=file_name,
             file_extension="cnx",
             timeout=timeout,
+            start_navigation=start_navigation,
+            generation=generation,
         )
     if raw_bytes is not None:
         file_bytes = raw_bytes
@@ -508,6 +595,8 @@ async def upload_route_plan(
             file_name=file_name,
             file_extension="cnx",
             timeout=timeout,
+            start_navigation=start_navigation,
+            generation=generation,
         )
     else:
         file_bytes = to_gpx_bytes(route)
@@ -576,19 +665,22 @@ async def upload_route_plan(
                 _LOG.debug("device returned status=4 after chunk %d/%d; stopping", i + 1, n)
                 break
 
-        if send_file_use:
+        if send_file_use or start_navigation:
             # FILE_USE commit: tells the device to switch to the
             # newly uploaded route. The app issues this in
             # `setRoutePlanFile` after every successful
-            # `sendRoutePlanFile`.
-            use_pb = _build_file_use_pb(file_id=file_id, file_extension=file_extension)
-            use_header = _build_file_use_header(use_pb)
-            await client._transport.send(use_pb, channel=data_channel)
-            await client._transport.send(use_header, channel="control")
-            response = await asyncio.wait_for(queue.get(), timeout=timeout)
-            use_status = response.frame.status
-            _LOG.debug("FILE_USE: status=%d (%s)", use_status, _status_name(use_status))
-            last_status = use_status
+            # `sendRoutePlanFile`. On the BSC200 this is also what
+            # actually starts navigation; see PROTOCOL.md §7.2.
+            last_status = await _send_file_use(
+                client,
+                file_id=file_id,
+                file_extension=file_extension,
+                generation=generation,
+                timeout=timeout,
+                existing_queue=queue,
+            )
+            if start_navigation and last_status not in (_STATUS_OK, _STATUS_DONE_EARLY):
+                raise NavigationStartError(last_status, file_id)
     finally:
         await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN, queue)
     return last_status
@@ -717,6 +809,8 @@ async def upload_general_file(
     file_extension: str,
     chunk_size: int | None = None,
     timeout: float = 30.0,
+    start_navigation: bool = False,
+    generation: int = 3,
 ) -> int:
     """Upload *file_bytes* via the FILE_OPERATION ADD path.
 
@@ -732,9 +826,20 @@ async def upload_general_file(
     + MTU 247 that's 244 bytes per chunk; with bleak's default MTU
     23 it's 20.
 
+    *start_navigation*, when True, issues a ``ROUTE_PLAN FILE_USE``
+    after a successful upload (only meaningful for
+    ``file_type=FILE_OP_TYPE_ROUTE_PLAN``). This activates the route
+    on the device and starts navigation — mirrors what
+    ``RoadBookSearchActivity.sendFileToDevice`` does in the
+    iGPSPORT app when its ``sendOnly`` flag is false. *generation*
+    is plumbed through to :func:`_send_file_use` to pick the correct
+    data-bearing characteristic for the FILE_USE protobuf body.
+
     Raises :class:`RouteUploadError` if the device returns a non-zero
-    status. Raises :class:`asyncio.TimeoutError` if no notification
-    arrives within *timeout*.
+    status to the upload itself. Raises :class:`NavigationStartError`
+    if the FILE_USE step (when requested) fails — the upload landed,
+    but the route is not active. Raises :class:`asyncio.TimeoutError`
+    if either reply does not arrive within *timeout*.
     """
     head = _build_file_operation_head(operate=_SERVICE_OPERATE_TYPE_ADD)
     pb = _build_general_file_operation_pb(
@@ -779,4 +884,19 @@ async def upload_general_file(
     )
     if status not in (_STATUS_OK, _STATUS_DONE_EARLY):
         raise RouteUploadError(status, 0, n_writes)
+    if start_navigation:
+        # The upload landed; now ask the device to activate the route.
+        # ROUTE_PLAN FILE_USE on the same `fourth` channel for gen 3+.
+        # The device firmware switches to navigation mode on
+        # status=0; the iGPSPORT app waits ~5 s here for the
+        # on-device UI to transition before dismissing its dialog.
+        nav_status = await _send_file_use(
+            client,
+            file_id=file_id,
+            file_extension=file_extension,
+            generation=generation,
+            timeout=timeout,
+        )
+        if nav_status not in (_STATUS_OK, _STATUS_DONE_EARLY):
+            raise NavigationStartError(nav_status, file_id)
     return status

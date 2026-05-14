@@ -789,23 +789,38 @@ async def _r_upload_route(
     BSC200 firmware rejects FIT same as raw GPX.
 
     An optional ``format=fit|gpx|cnx`` token overrides the default.
-    See PROTOCOL.md §7.
+
+    Pass a bare ``start`` (or ``start=true``) to also send the
+    ``ROUTE_PLAN FILE_USE`` step after a successful upload — this
+    activates the route on the device and starts on-screen
+    navigation, mirroring what the iGPSPORT Android app does when
+    the user picks "send and use" on a route. Without it, the file
+    lands on the device but the user must select it manually.
+
+    See PROTOCOL.md §7 and §7.2.
     """
     import pathlib
 
     from . import routes as _routes
 
     if not args:
-        raise CommandError("upload-route takes <path> [file_id] [format=gpx|fit|cnx]")
+        raise CommandError("upload-route takes <path> [file_id] [format=gpx|fit|cnx] [start]")
     positional: list[str] = []
     forced_format: str | None = None
+    start_navigation = False
     for arg in args:
         if arg.startswith("format="):
             forced_format = arg.split("=", 1)[1].lower()
             continue
+        if arg in {"start", "--start", "start=true", "start=yes", "start=1"}:
+            start_navigation = True
+            continue
+        if arg in {"start=false", "start=no", "start=0"}:
+            start_navigation = False
+            continue
         positional.append(arg)
     if not positional:
-        raise CommandError("upload-route takes <path> [file_id] [format=...]")
+        raise CommandError("upload-route takes <path> [file_id] [format=...] [start]")
     path = positional[0]
     file_id = 1
     if len(positional) >= 2:
@@ -834,6 +849,7 @@ async def _r_upload_route(
             timeout=max(30.0, timeout),
             raw_bytes=raw,
             raw_name=p.stem,
+            start_navigation=start_navigation,
         )
         return UploadedRoute(
             source=path,
@@ -872,6 +888,7 @@ async def _r_upload_route(
         file_extension=wire_format,
         timeout=max(30.0, timeout),
         waypoints=waypoints,
+        start_navigation=start_navigation,
     )
     return UploadedRoute(
         source=path,
@@ -1000,8 +1017,10 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
         name="upload-route",
         description=(
             "Upload a GPX / geoJSON / CNX / FIT route file (GPX & geoJSON "
-            "are converted to CNX locally): upload-route <path> [file_id] "
-            "[format=gpx|fit|cnx]"
+            "are converted to CNX locally). Append 'start' to also "
+            "activate the route (FILE_USE → starts navigation on the "
+            "device). Syntax: upload-route <path> [file_id] "
+            "[format=gpx|fit|cnx] [start]"
         ),
         runner=_r_upload_route,
     ),

@@ -6,6 +6,64 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-05-15
+
+Upload-and-go: the library can now end the route upload by also
+flipping the device into navigation mode, mirroring what the
+iGPSPORT Android app does when the user picks "send and use" on a
+route. Reverse-engineered from
+``IGPDeviceManager.setRoutePlanFile`` and
+``RoadBookSearchActivity.useRoutePlan`` / ``sendFileToDevice``.
+
+### Added
+- ``upload_route_plan(..., start_navigation=True)`` and
+  ``upload_general_file(..., start_navigation=True, generation=...)``
+  — after a successful upload, issue a ``ROUTE_PLAN FILE_USE``
+  (operate_type=5) carrying the new ``file_id`` and the file
+  extension. The device activates the route and switches its UI
+  into navigation mode; the iGPSPORT app waits ~5 s here before
+  dismissing its progress dialog. Default ``False`` — opt-in, same
+  as the app's ``sendOnly = true`` path that skips FILE_USE.
+- ``ligpsport.file_transfer.NavigationStartError`` — raised when
+  the FILE_USE step is requested but the device returns a non-zero
+  ``DeviceReturnStatus``. The upload itself is still considered
+  successful (the file landed); the route just isn't active. The
+  exception surfaces ``status``, ``status_name`` (e.g.
+  ``"NavigationRouteDoesNotExist"``) and ``file_id``.
+- ``ligpsport.file_transfer._send_file_use`` — internal helper
+  factored out of the existing chunked-path FILE_USE block. The
+  same routine now drives the FILE_OPERATION (CNX) path. Carries
+  the gen-aware channel choice (``"fourth"`` for gen ≥ 3,
+  ``"data"`` otherwise) and the two-channel split (body on the
+  data-bearing UART, 20-byte header on control) the smali emits.
+- ``upload-route ... start`` CLI flag: appending the bare token
+  ``start`` (or ``start=true`` / ``--start``) to an ``upload-route``
+  invocation triggers the FILE_USE step. Without it the file
+  uploads but the user must pick the route on-device.
+
+  ```sh
+  ligpsport command --name bike upload-route trip.gpx 1 start
+  ligpsport command --name bike upload-route trip.cnx 7 start
+  ```
+- ``docs/PROTOCOL.md`` §7.2 — wire format for ``ROUTE_PLAN
+  FILE_USE``, the channel split per device generation, and notes
+  on the absence of a "stop navigation" inverse op.
+- Simulator: ``Simulator._absorb_general_upload_chunk`` reassembles
+  multi-write FILE_OPERATION ADD streams on the ``fourth`` channel
+  by reading the head + 4-byte pb-size prefix + protobuf
+  ``file_size`` field, then records the upload in
+  ``state.uploaded_routes`` and acks on the FILE_OPERATION service.
+  This makes the new ``test_file_operation_upload_starts_navigation``
+  hermetic end-to-end test possible.
+
+### Changed
+- ``upload_route_plan``'s chunked path now respects
+  ``start_navigation`` in addition to the existing ``send_file_use``
+  parameter (both trigger FILE_USE; ``start_navigation`` further
+  promotes a refusal into ``NavigationStartError``). Existing
+  callers that relied on ``send_file_use=True`` keep working
+  unchanged.
+
 ## [1.0.0] — 2026-05-15
 
 Route upload lands on the BSC200. The library now performs the full
