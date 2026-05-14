@@ -664,3 +664,141 @@ this failure as non-fatal so CI doesn't depend on a u-blox token.
 field when the piggybacked seed succeeds. Absence of the field means
 the AGPS step was skipped — no token, no network, or device rejection.
 The route upload itself succeeds or fails independently.
+## 13. Position-prior injection (FACTORY GPS_COORDINATE_SET)
+
+AGPS supplies "which satellite is where in orbit" via UBX-MGA-EPH;
+the BSC200's chip still has to figure out **which satellites are
+visible from where I am** before it can fix. A receiver that doesn't
+know its rough position has to do a sky search; one that has a hint
+within ~100 km can drop straight into search of the visible subset.
+The official app sends the phone's current fix to the device for
+exactly this reason — short message, big TTFF win when paired with
+AGPS.
+
+The proto and the operation type are buried in `factory.proto`,
+which sounds factory-only. It is not: the production app calls this
+from `BroadcastViewModel` (live-tracking group rides) and
+`RecordingViewModel` (recording flow) — see the smali list in
+§13.4. Despite the FACTORY service number this command is not
+destructive; it just hands the receiver a lat/lon hint.
+
+### 13.1 Wire format
+
+A plain PbFrame on the Control channel:
+
+| header field | value                                              |
+|--------------|----------------------------------------------------|
+| `service`    | 11 (`FACTORY`)                                     |
+| `operation`  | 8 (`FACTORY_OPERATE_TYPE_GPS_COORDINATE_SET`)      |
+| payload      | `factory_msg{service_type=11, factory_operate_type=8, gps_coordinate_msg={lat, lon}}` |
+
+Total wire size for the body is **24 bytes** of protobuf — the entire
+frame fits in one BLE write at any negotiated MTU.
+
+The device replies with a `ConfirmFrame` on the **Data** channel
+(matching the BSC200 control/reply split documented in §1), `status=0`
+on success.
+
+### 13.2 Proto schemas
+
+`factory.proto` (excerpt):
+
+```protobuf
+enum FACTORY_OPERATE_TYPE {
+  enum_FACTORY_OPERATE_TYPE_NONE              = 0;
+  enum_FACTORY_OPERATE_TYPE_SN_GET            = 1;
+  // ...
+  enum_FACTORY_OPERATE_TYPE_GPS_COORDINATE_SET = 8;   // 设置GPS坐标
+  // ...
+}
+
+message gps_coordinate_message {
+  optional double latitude  = 1;  // 0 means "no fix"
+  optional double longitude = 2;  // 0 means "no fix"
+}
+
+message factory_msg {
+  required service_type_index   service_type         = 1 [default = enum_SERVICE_TYPE_INDEX_FACTORY];
+  required FACTORY_OPERATE_TYPE factory_operate_type = 2 [default = enum_FACTORY_OPERATE_TYPE_NONE];
+  // ...
+  optional gps_coordinate_message gps_coordinate_msg = 9;
+  // ...
+}
+```
+
+### 13.3 Hand-rolled encoding
+
+```
+factory_msg outer:
+  field 1 (service_type)         varint = 11  → 08 0B
+  field 2 (factory_operate_type) varint = 8   → 10 08
+  field 9 (gps_coordinate_msg)   len-delim    → 4A 12 <18 bytes>
+
+gps_coordinate_message inner:
+  field 1 (latitude)  fixed64 (double LE)     → 09 <8 bytes>
+  field 2 (longitude) fixed64 (double LE)     → 11 <8 bytes>
+```
+
+Total payload: 24 bytes. Lat/lon are IEEE-754 doubles in
+little-endian — the protobuf spec requires LE for `fixed64`
+regardless of platform.
+
+### 13.4 Reverse-engineering provenance
+
+- `IGPDeviceManager.setCoordinate(gps_coordinate_message)` — public
+  method at `classes4.dex` line ~26349. Returns a `BaseCommand<Boolean>`,
+  routes via `firstQueue` (the Control channel).
+- `ManufacturerServiceFactory.getMessage(operationType, …)` —
+  `classes4.dex` line ~148. Builds `factory_msg` from the per-field
+  options, calls `setMainCommandByte(operationType.number)` to stamp
+  the header.
+- Call sites in the production app (`grep -rln "setCoordinate"
+  tmp/smali-*`):
+  - `com.igpsport.globalapp.broadcast.fragment.BroadcastCyclingFragment`
+  - `com.igpsport.globalapp.broadcast.model.BroadcastViewModel`
+  - `com.igpsport.globalapp.devicemodule.sportsdetail.model.SportsDetailViewModel`
+  - `com.igpsport.globalapp.record.fragment.RecordingMapFragment`
+  - `com.igpsport.globalapp.record.model.RecordingViewModel`
+
+None of those are factory-test screens — every one is a normal
+end-user flow.
+
+### 13.5 Reference Kotlin implementation (`ligpsport-android`)
+
+- `ble/LocationInjector.kt#setCoordinate(transport, lat, lon)` —
+  builds the 24-byte protobuf with hand-rolled fixed64 encoding,
+  wraps in a `Frame(service=FACTORY, operation=GPS_COORDINATE_SET)`,
+  awaits the ConfirmFrame.
+- `ble/UploadPipeline.kt#sendCurrentLocation(context)` — public entry:
+  resolves the phone's location via
+  `MockLocationStore → FusedLocationProviderClient.getCurrentLocation
+  → lastLocation`, opens the paired transport, calls
+  `LocationInjector.setCoordinate`.
+- `ble/UploadPipeline.kt#injectCurrentLocationBestEffort` — internal
+  helper piggybacked onto every `uploadGpx` call, sandwiched between
+  the AGPS step (§12.4) and the route upload. Failure is silent;
+  success surfaces as `seed_lat=` + `seed_lon=` fields on the RESULT
+  line.
+
+### 13.6 Headless test harness
+
+The adb-driven e2e suite exposes a standalone broadcast:
+
+```sh
+adb shell am broadcast \
+  -n de.syntaxfehler.ligpsport.debug/de.syntaxfehler.ligpsport.cli.AdbCliReceiver \
+  -a de.syntaxfehler.ligpsport.action.SEND_LOCATION \
+  --es req_id "$RANDOM"
+```
+
+emits
+
+```
+LigpsportAdb: RESULT action=SEND_LOCATION req_id=… status=OK
+              name=BSC200 mac=… seed_lat=48.77000 seed_lon=9.18000 device_status=0
+```
+
+Use `MOCK_LOCATION --ef lat --ef lon` first if the test rig has no
+real GPS fix. `PLAN_AND_UPLOAD` / `UPLOAD` lines gain
+`seed_lat=` + `seed_lon=` when the piggybacked injection succeeds;
+absence means the step was skipped (no fix or device rejection).
