@@ -24,7 +24,10 @@ spec).
 | Read commands (`version`, `status`, `user`, `firmware`, `rides`, `sensors`, `routes`, `route-books`, `wifi`) | yes |
 | Write commands (`set-rtc`, `set-user`)        | yes         |
 | Destructive commands (`delete-ride`, `delete-all-rides`) gated | yes |
-| File download (`get-ride`)                    | yes (simulator-verified) |
+| File download (`get-ride`, `download-activity`) | yes (live-verified) |
+| Activity FIT → GPX conversion (`download-activity type=gpx`) | yes (live-verified on BSC200) |
+| Bulk activity pull (`download-all-activities`) | yes (live-verified, idempotent re-runs) |
+| Synthetic activity generator (`sim-activity`)  | wire path verified — BSC200 firmware acks but silently no-ops |
 | Real-time status streaming (`status --watch`) | yes         |
 | GPX / geoJSON route parsing + GPX emission    | yes (stdlib only) |
 | BlueZ-direct backend with MTU negotiation     | yes (`--backend bluez`) |
@@ -60,8 +63,19 @@ nix run . -- command --name bike routes
 nix run . -- command --name bike status --watch 30
 
 # Download a ride file (BSC200 must have a recorded ride first).
-nix run . -- command --name bike rides
-nix run . -- command --name bike get-ride <timestamp> /tmp/ride.fit
+nix run . -- command --name bike list-activities
+nix run . -- command --name bike download-activity <timestamp> /tmp/ride.fit
+
+# Convert the FIT to GPX on the way down (one trkpt per FIT record).
+nix run . -- command --name bike download-activity <timestamp> /tmp/ride.gpx type=gpx
+
+# Or write to a directory and let the library pick the filename
+# (<YYYYMMDDTHHMMSSZ>_<model>.<ext>, UTC from file_id.time_created).
+nix run . -- command --name bike download-activity <timestamp> /tmp/
+
+# Bulk pull every activity on the device into a directory.
+# Skips files that already exist on a re-run.
+nix run . -- command --name bike download-all-activities /tmp/bsc200/ type=gpx
 
 # Write commands.
 nix run . -- command --name bike set-rtc                     # sets clock to now
@@ -69,6 +83,12 @@ nix run . -- command --name bike set-user weight_kg=72 age=30 height_cm=178
 
 # Destructive commands require explicit opt-in.
 nix run . -- command --name bike delete-ride <timestamp> \
+    --allow-destructive-commands
+
+# Generate fake activity files (FACTORY/SIM_FIT_SET). Useful on
+# simulators / iGS models that honour the op; the BSC200 firmware
+# acks status=0 but silently no-ops.
+nix run . -- command --name bike sim-activity count=1 size=4096 \
     --allow-destructive-commands
 ```
 

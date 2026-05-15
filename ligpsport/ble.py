@@ -86,24 +86,32 @@ class BleakTransport(Transport):
 
         client = BleakClient(self._address)
         await client.connect()
-        # Surface _acquire_mtu failures at WARNING — silently suppressing
-        # them left bleak's _mtu_size unset, so every write logged a
-        # "Using default MTU value" UserWarning.
-        try:
-            await client._acquire_mtu()  # type: ignore[attr-defined]
-            _LOG.info("acquired MTU=%d on %s", self._mtu(), self._address)
-        except Exception as exc:
-            _LOG.warning(
-                "bleak _acquire_mtu() failed (%s: %s); using fallback MTU",
-                type(exc).__name__,
-                exc,
-            )
+        # bleak's MTU acquisition is on the backend (BleakClientBlueZDBus
+        # in our case); the public BleakClient proxy doesn't expose it.
+        # Without this, every write fires bleak's
+        # "Using default MTU value" UserWarning from
+        # bleak/backends/bluezdbus/client.py.
+        backend = getattr(client, "_backend", client)
+        acquire_mtu = getattr(backend, "_acquire_mtu", None)
+        if acquire_mtu is not None:
+            try:
+                await acquire_mtu()
+                _LOG.info("acquired MTU=%d on %s", self._mtu(), self._address)
+            except Exception as exc:
+                _LOG.warning(
+                    "bleak _acquire_mtu() failed (%s: %s); using fallback MTU",
+                    type(exc).__name__,
+                    exc,
+                )
+        else:
+            _LOG.info("bleak backend has no _acquire_mtu(); using fallback MTU")
         # If bleak still doesn't know the real MTU, set _mtu_size by
-        # hand. Silences bleak's per-write warning; the kernel/controller
-        # fragments oversize writes, so a slight over-estimate is safe.
-        # Use BluezTransport (--backend bluez) for an exact MTU.
-        if self._mtu() <= self._DEFAULT_MTU:
-            client._mtu_size = self._FALLBACK_MTU  # type: ignore[attr-defined]
+        # hand. The mtu_size getter checks `_mtu_size is None` and
+        # otherwise warns + returns 23; setting it silences that path
+        # without lying about the link-layer MTU since the kernel
+        # fragments writes that exceed the negotiated value.
+        if getattr(backend, "_mtu_size", None) in (None, 0):
+            backend._mtu_size = self._FALLBACK_MTU  # type: ignore[attr-defined]
             _LOG.info("forcing _mtu_size=%d as fallback", self._FALLBACK_MTU)
         # Subscribe to TX on every channel. The BSC200 receives on the
         # Control RX (8e) but emits responses on the Data TX (9e), and

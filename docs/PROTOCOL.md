@@ -364,6 +364,40 @@ itself only ever emits activity files, never accepts them.
   a write but not destructive (no data loss).
 * **`SN_SET=3`** and **`SIM_FIT_SET=7`** — destructive, gated.
 
+#### SIM_FIT_SET (op 7) — fake activity generator
+
+`SIM_FIT_SET` carries a `sim_fit_message { num, size }` body
+(per `reference/factory.proto:92-96`) and instructs the device
+to synthesise `num` activity FIT files of `size` bytes each into
+its recorded-activity flash. The iGPSPORT Android app wires the
+op up via `IGPDeviceManager.simulateFitFile` (smali line ~28008)
+but only ships it behind an internal debug menu.
+
+```
+factory_msg {
+    factory_operate_type = SIM_FIT_SET (7)
+    sim_fit_message {
+        num  = <count>
+        size = <bytes_per_file>
+    }
+}
+```
+
+The library exposes this as
+:func:`file_transfer.simulate_fit_files` and the
+`sim-activity` CLI command, both gated by the destructive flag.
+
+**BSC200 firmware behaviour (live-verified 2026-05-16, firmware
+2024-05-14):** the device acks the request with ``status=0`` but
+**does not actually create any FIT files** — a follow-up
+``LIST_GET`` returns the same list as before. The Android app
+wires the op up but the BSC200 firmware in scope here silently
+no-ops it. Other iGS / BSC variants may honour the op; the
+library returns the wire status byte unchanged so callers can
+distinguish ack-from-implementation. To populate the activity
+list for e2e tests on a BSC200, the user has to physically
+record a short ride.
+
 ### 6.10 BLE (service 10)
 
 * **`BOND_REQ=2`** with a `ble_data_message` carrying the app's
@@ -1152,32 +1186,38 @@ the iGPSPORT app's gen-4 behaviour here is a latent bug, not the
 protocol's intent. Live-verified: a single merged write returns
 ``status=0`` and the activity list goes empty.
 
-##### Active-file protection (FILE_DEL only)
+##### FILE_DEL: ack means deleted
 
-The BSC200 firmware mirrors the **active-route protection** seen
-in ROUTE_PLAN (§7.4) but for activities: a ``FILE_DEL`` request
-targeting an activity the firmware still considers "open" or
-"in progress" returns ``status=0`` (ack) — and silently keeps
-the file. Live-verified: an attempt at FILE_DEL on a freshly
-recorded activity (timestamp from earlier the same day) returned
-``status=0`` but a follow-up ``LIST_GET`` showed the entry still
-present. ``ALL_DEL`` on the same file bypassed the protection
-and cleared the list.
+A ``FILE_DEL`` request targeting an existing activity returns
+``status=0`` and the entry is gone from the next ``LIST_GET``.
+Live-verified 2026-05-16 against firmware 2024-05-14: a freshly
+recorded ride was listed, ``FILE_DEL`` ack'd with ``status=0``,
+and the next ``LIST_GET`` returned an empty list.
 
-| Op | Same activity | Wire status | Effect on device |
-|----|----------------|-------------|------------------|
-| ``FILE_DEL`` (5) | freshly recorded | ``0`` (ok) | None — silently kept |
-| ``ALL_DEL`` (6) | freshly recorded | ``0`` (ok) | Removed from LIST_GET |
+| Op | Wire status | Effect on device |
+|----|-------------|------------------|
+| ``FILE_DEL`` (5) | ``0`` (ok) | Activity removed from LIST_GET |
+| ``ALL_DEL`` (6)  | ``0`` (ok) | All activities removed from LIST_GET |
+
+> **Retraction.** Earlier releases (v1.3 and prior) documented an
+> "active-file protection" mirroring ROUTE_PLAN's active-route
+> protection — i.e., the firmware silently keeping a recently
+> recorded activity after a ``FILE_DEL`` ack. The 2026-05-16
+> retest could not reproduce it. The "silently kept" observation
+> traces back to a probe-heavy debugging session whose
+> speculative ``file_tag = 0xAA`` write wedged the device's parser
+> (cf. AGENTS.md §2); the device was either returning a
+> stale ``LIST_GET`` while still parked or replying with a
+> zeroed-out frame from the wedged state. There is **no
+> firmware-level active-file protection** for activities — every
+> ride listed by ``LIST_GET`` is deletable with ``FILE_DEL``.
 
 The library's :func:`file_transfer.delete_activity` returns the
-status byte directly; ``0`` is success on the wire but does not
-guarantee deletion. The CLI's ``del-activity`` wraps it with a
-pre/post ``LIST_GET`` so the
-:class:`commands.DelActivityResult` can report honestly whether
-the entry actually disappeared. Callers that need a hard
-guarantee should fall back to
-:func:`file_transfer.delete_all_activities` when ``delete_activity``
-acks ``status=0`` but the entry survives.
+status byte; the CLI's ``del-activity`` still wraps it with a
+pre/post ``LIST_GET`` and surfaces a ``deleted`` boolean in
+:class:`commands.DelActivityResult` so callers can tell a wire
+ack apart from any future firmware regression that re-introduces
+silent denial.
 
 #### No upload — by design
 
@@ -1199,6 +1239,37 @@ If a future firmware ever exposes an app→device write path it
 would surface in this repo by adding a new op to
 ``cycling_data.proto`` and a matching method on
 ``IGPDeviceManager`` — neither exists today.
+
+#### Library / CLI surface
+
+All three CYCLING_DATA wire ops have library entry points and
+matching CLI commands, all built on the wire protocol documented
+above (no new framing):
+
+* :func:`file_transfer.list_activities` ↔ ``list-activities``
+* :func:`file_transfer.download_activity` ↔ ``download-activity``
+* :func:`file_transfer.delete_activity` ↔ ``del-activity``
+* :func:`file_transfer.delete_all_activities` ↔ ``delete-all-rides``
+
+The library also offers two ergonomic wrappers that don't add new
+wire ops:
+
+* ``download-activity <ts> <path> [type=fit|gpx]`` — when
+  ``type=gpx``, the downloaded FIT is parsed with ``fitparse``
+  (see :mod:`ligpsport.fit_activity`) and re-emitted as GPX 1.1
+  with one ``<trkpt>`` per FIT ``record`` carrying lat/lon.
+  When ``<path>`` is a directory the file lands as
+  ``<YYYYMMDDTHHMMSSZ>_<device_model>.<ext>`` (UTC time from the
+  FIT ``file_id.time_created``).
+* ``download-all-activities <out-dir> [type=fit|gpx]`` — iterates
+  ``LIST_GET``, downloads each entry, writes with the derived
+  name, and skips entries whose target file already exists.
+
+For destructive e2e testing, ``sim-activity count=N size=BYTES``
+exposes FACTORY/SIM_FIT_SET (§6.9) — but as documented there, the
+BSC200 firmware in scope here acks the op without materialising
+the files. On a BSC200 you still need to physically record a ride
+to populate the activity list.
 
 ## 8. Destructive operations
 

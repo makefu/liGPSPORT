@@ -6,6 +6,84 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-05-16
+
+Activity downloads gain format conversion, bulk pull, and an
+automatic filename derivation; the bleak transport stops printing
+the per-write ``Using default MTU value`` warning; the v1.3.0
+"active-file protection" claim in PROTOCOL.md §7.5 is retracted
+after a live retest could not reproduce it.
+
+### Added
+- ``sim-activity count=N size=BYTES`` command + library
+  :func:`file_transfer.simulate_fit_files`: FACTORY ``SIM_FIT_SET``
+  (op 7) per ``reference/factory.proto:92-96`` and
+  ``IGPDeviceManager.simulateFitFile``. Marked destructive,
+  gated behind ``--allow-destructive-commands``. Simulator
+  honours the op and synthesises listing entries; **on a
+  BSC200 the firmware acks ``status=0`` but does not actually
+  create the files** — wire path verified, firmware behaviour
+  documented in PROTOCOL.md §6.9.
+- ``download-activity ... type=gpx`` (or ``--type gpx``): the
+  downloaded FIT is parsed with ``fitparse`` and re-emitted as
+  GPX 1.1 with one ``<trkpt>`` per FIT ``record`` carrying
+  lat/lon, altitude, and timestamp. Default remains ``type=fit``
+  (raw FIT bytes).
+- ``download-all-activities <out-dir> [type=fit|gpx]``: bulk pull
+  of every activity on the device. Skips entries whose target
+  file already exists (idempotent re-runs). Result dataclass
+  :class:`commands.DownloadedActivityList` enumerates both the
+  downloaded and skipped paths.
+- ``ligpsport.fit_activity``: stdlib + ``fitparse`` module with
+  an Activity-FIT reader, a GPX 1.1 writer, and a shared
+  ``activity_filename(timestamp, device_model, extension)``
+  helper. Filenames follow ``<YYYYMMDDTHHMMSSZ>_<model>.<ext>``
+  (UTC) — derived from ``file_id.time_created`` for single
+  downloads, from the listing timestamp for bulk.
+- ``fitparse`` promoted from a test-only input to a runtime
+  dependency in ``pyproject.toml`` and ``flake.nix``.
+
+### Fixed
+- ``BleakTransport.open`` now calls ``_acquire_mtu`` on the
+  bleak backend rather than the public wrapper (bleak 2.x moved
+  the method to ``BleakClient._backend``) and sets
+  ``_mtu_size`` directly when acquisition fails. The per-write
+  ``UserWarning: Using default MTU value`` from
+  ``bleak/backends/bluezdbus/client.py`` is now silenced
+  legitimately — verified against a live BSC200 with
+  ``command --name bike version``.
+- ``_acquire_mtu`` failures no longer get swallowed by a bare
+  ``contextlib.suppress(Exception)``; they log at WARNING with
+  the exception type and message.
+
+### Documentation
+- ``docs/PROTOCOL.md`` §7.5 — **retraction**: the v1.3.0 "active-
+  file protection (FILE_DEL only)" claim was wrong. Live retest
+  2026-05-16 against firmware 2024-05-14 with a freshly
+  recorded ride showed ``FILE_DEL`` acks ``status=0`` and the
+  next ``LIST_GET`` returns empty. The earlier "silently kept"
+  observation traces back to a probe-heavy debugging session
+  that wedged the device's parser via a speculative
+  ``file_tag = 0xAA`` write (cf. AGENTS.md §2 guardrail).
+- ``docs/PROTOCOL.md`` §6.9 — flesh out FACTORY ``SIM_FIT_SET``
+  with the ``sim_fit_message`` payload shape, smali provenance,
+  and the BSC200 no-op finding.
+- ``docs/PROTOCOL.md`` §7.5 — note the new library / CLI
+  surface (``simulate_fit_files``, ``download-activity
+  type=gpx``, ``download-all-activities``) and that none of
+  them add new wire ops.
+
+### Notes
+- Live-verified against ``F7:11:62:07:21:F5`` on firmware
+  2024-05-14: ``list-activities`` → ``download-activity ts
+  /tmp/x.fit`` (``fit_magic=True``) → ``download-activity ts
+  /tmp/x.gpx type=gpx`` (12 ``<trkpt>`` with real GPS) →
+  ``download-activity ts /tmp/ type=fit`` (derived filename
+  ``20260515T215627Z_BSC200.fit``) → ``download-all-activities
+  /tmp/x/ type=gpx`` (entry written, re-run reports skipped) →
+  ``del-activity ts`` (``deleted=true``) → ``list-activities``
+  empty.
+
 ## [1.3.0] — 2026-05-15
 
 Two new commands aimed at managing routes from the CLI:
