@@ -6,7 +6,7 @@ Skipped by default. To run against a real BSC200::
       nix develop --command pytest -q -m bsc200 tests/test_bsc200_live.py
 
 These tests cover **read-only paths only**. Destructive ops
-(``sim-activity`` / ``del-activity`` / ``delete-all-rides``) are
+(``sim-activity`` / ``del-activity`` / ``del-all-activities``) are
 deliberately excluded so the suite is safe to re-run repeatedly
 without manual prep. The destructive paths are exercised against
 the in-tree simulator in ``tests/test_activities.py`` and live-
@@ -16,7 +16,7 @@ auto-runnable here because:
 
 * Deleting the device's lone recorded activity wipes the test
   target for every subsequent live run, forcing the engineer to
-  manually record a new ride before the suite can pass again.
+  manually record a new activity before the suite can pass again.
 * ``sim-activity`` acks ``status=0`` on BSC200 firmware
   2024-05-14 but silently no-ops, so it can't seed a replacement
   activity either (PROTOCOL.md §6.9). Until iGPSPORT firmware
@@ -82,11 +82,6 @@ async def test_live_status(client: IgpsportClient) -> None:
 async def test_live_user(client: IgpsportClient) -> None:
     result = await run_named(client, "user", timeout=10.0)
     assert isinstance(result.value, UserConfig)
-
-
-async def test_live_rides(client: IgpsportClient) -> None:
-    result = await run_named(client, "rides", timeout=10.0)
-    assert isinstance(result.value, ActivityList)
 
 
 async def test_live_list_activities(client: IgpsportClient) -> None:

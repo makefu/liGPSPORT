@@ -211,7 +211,7 @@ async def _cmd_command(args: argparse.Namespace) -> int:
         async with _open_transport(address) as transport, IgpsportClient(transport) as client:
             if args.watch is not None and args.operation == "status":
                 # Stream DEV_STATUS notifications. The device sends them
-                # unsolicited while a ride is active; otherwise we poll
+                # unsolicited while an activity is active; otherwise we poll
                 # explicitly every second.
                 deadline = _asyncio.get_running_loop().time() + (args.watch or 30.0)
                 while _asyncio.get_running_loop().time() < deadline:

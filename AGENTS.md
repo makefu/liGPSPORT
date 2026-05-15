@@ -28,7 +28,7 @@ Cite those Java sources in commit messages when you adjust framing.
 ## 2. Destructive commands can lose data on the device
 
 These operations alter persistent state on the bike computer —
-erasing recorded rides, overwriting configuration that the user
+erasing recorded activities, overwriting configuration that the user
 spent time entering, or interrupting an in-progress flash:
 
 * `FACTORY` service reset / RTC overwrite

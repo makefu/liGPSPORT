@@ -1,6 +1,6 @@
 """Activity-FIT reader, GPX writer, and filename helpers.
 
-The bike computer stores recorded rides as Garmin FIT *activity*
+The bike computer stores recorded activities as Garmin FIT *activity*
 files. This module parses those files via :mod:`fitparse` and
 re-renders them as GPX 1.1 tracks, with the Garmin
 ``TrackPointExtension`` namespace carrying HR / cadence and the

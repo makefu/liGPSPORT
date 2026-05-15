@@ -21,10 +21,10 @@ spec).
 | Live-device transport over `bleak`            | yes         |
 | Credential storage (XDG, atomic, 0600)        | yes         |
 | Named-command registry + destructive gate     | yes         |
-| Read commands (`version`, `status`, `user`, `firmware`, `rides`, `sensors`, `routes`, `route-books`, `wifi`) | yes |
+| Read commands (`version`, `status`, `user`, `firmware`, `list-activities`, `sensors`, `routes`, `route-books`, `wifi`) | yes |
 | Write commands (`set-rtc`, `set-user`)        | yes         |
-| Destructive commands (`delete-ride`, `delete-all-rides`) gated | yes |
-| File download (`get-ride`, `download-activity`) | yes (live-verified) |
+| Destructive commands (`del-activity`, `del-all-activities`) gated | yes |
+| Activity download (`download-activity`)        | yes (live-verified) |
 | Activity FIT → GPX conversion (`download-activity type=gpx`) | yes (live-verified on BSC200) |
 | Bulk activity pull (`download-all-activities`) | yes (live-verified, idempotent re-runs) |
 | Synthetic activity generator (`sim-activity`)  | wire path verified — BSC200 firmware acks but silently no-ops |
@@ -41,19 +41,6 @@ spec).
 `nix build .#default` runs ruff + format + 50 unit tests. The
 optional `nix flake check` adds a strict mypy pass.
 
-### Terminology: rides vs. activities
-
-The CYCLING_DATA service (PROTOCOL.md §6.4) stores each recorded
-ride as a Garmin **FIT** file the iGPSPORT app calls an *Activity*
-(``HistoryActivity``, ``readActivityFitFile``, ...). v1.0–v1.3 of
-this library shipped CLI commands named after "rides" (``rides``,
-``get-ride``, ``delete-ride``, ``delete-all-rides``); v1.4
-introduced the matching ``list-activities`` / ``download-activity`` /
-``del-activity`` names that align with the upstream vocabulary. Both
-spellings hit the exact same wire ops on the exact same service and
-are interchangeable — pick whichever reads better. The
-``activities`` spelling is preferred in new docs and scripts.
-
 ## Quickstart
 
 ```sh
@@ -68,19 +55,19 @@ nix run . -- command --name bike version
 nix run . -- command --name bike firmware
 nix run . -- command --name bike status
 nix run . -- command --name bike user
-nix run . -- command --name bike rides
+nix run . -- command --name bike list-activities
 nix run . -- command --name bike sensors
 nix run . -- command --name bike routes
 
-# Stream live ride status at 1Hz for 30 seconds.
+# Stream live cycling status at 1Hz for 30 seconds.
 nix run . -- command --name bike status --watch 30
 
-# Download a ride file (BSC200 must have a recorded ride first).
+# Download an activity file (BSC200 must have a recorded activity first).
 nix run . -- command --name bike list-activities
-nix run . -- command --name bike download-activity <timestamp> /tmp/ride.fit
+nix run . -- command --name bike download-activity <timestamp> /tmp/activity.fit
 
 # Convert the FIT to GPX on the way down (one trkpt per FIT record).
-nix run . -- command --name bike download-activity <timestamp> /tmp/ride.gpx type=gpx
+nix run . -- command --name bike download-activity <timestamp> /tmp/activity.gpx type=gpx
 
 # Or write to a directory and let the library pick the filename
 # (<YYYYMMDDTHHMMSSZ>_<model>.<ext>, UTC from file_id.time_created).
@@ -95,7 +82,7 @@ nix run . -- command --name bike set-rtc                     # sets clock to now
 nix run . -- command --name bike set-user weight_kg=72 age=30 height_cm=178
 
 # Destructive commands require explicit opt-in.
-nix run . -- command --name bike delete-ride <timestamp> \
+nix run . -- command --name bike del-activity <timestamp> \
     --allow-destructive-commands
 
 # Generate fake activity files (FACTORY/SIM_FIT_SET). Useful on
@@ -125,9 +112,10 @@ async def main():
     async with BleakTransport("F7:11:62:07:1F:F5") as t, IgpsportClient(t) as c:
         result = await run_named(c, "version")
         print(result.value.compile_time)
-        # ride file:
+        # activity file:
         from ligpsport import file_transfer
-        data = await file_transfer.download_cycling_data(c, timestamp=...)
+        activity = await file_transfer.download_activity(c, timestamp=...)
+        print(len(activity.content), "bytes")
 
 asyncio.run(main())
 ```

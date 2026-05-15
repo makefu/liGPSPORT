@@ -3,7 +3,7 @@
 The simulator is the iGPSPORT-side equivalent of the client: same
 framing codec, same envelope router, same protobuf modules. Tests
 hand it the peer-end of a :class:`ligpsport.transport.LoopbackTransport`
-pair and configure a small in-memory state (device version, ride
+pair and configure a small in-memory state (device version, activity
 list, configuration values). The simulator runs a background read
 loop, dispatches incoming frames to per-service handlers, and writes
 replies back through the same transport. No protocol detail is
@@ -53,7 +53,7 @@ Handler = Callable[
 
 
 @dataclasses.dataclass(slots=True)
-class SimulatedRideFile:
+class SimulatedActivityFile:
     """One entry in the simulator's recorded-activity file list."""
 
     timestamp: int
@@ -142,8 +142,8 @@ class SimulatorState:
     user_time_zone_s: int = 0
     user_member_id: str = "ligpsport-sim"
 
-    # Recorded rides (CYCLING_DATA service).
-    ride_files: list[SimulatedRideFile] = dataclasses.field(default_factory=list)
+    # Recorded activities (CYCLING_DATA service).
+    activity_files: list[SimulatedActivityFile] = dataclasses.field(default_factory=list)
 
     # Paired sensors (SENSOR service).
     sensors: list[SimulatedSensor] = dataclasses.field(default_factory=list)
@@ -247,7 +247,7 @@ async def _handle_cycling_data(
 
     * ``LIST_GET`` (op=1, file_tag=0xFF): reply with one
       ``cycling_data_file_flag_msg`` per entry in
-      :attr:`SimulatorState.ride_files`.
+      :attr:`SimulatorState.activity_files`.
     * ``FILE_GET`` (op=3, file_tag=0x55): reply with a single
       transmit-complete PbFrame: 20-byte head with
       ``file_tag=0x55`` and ``end_marker=0x03``, then 4-byte BE
@@ -258,8 +258,8 @@ async def _handle_cycling_data(
       stream length); we mirror that quirk so the framing layer's
       transmit-complete path is exercised end-to-end.
     * ``FILE_DEL`` (op=5): drop the matching entry from
-      ``ride_files`` and ACK with status=0.
-    * ``ALL_DEL`` (op=6): clear ``ride_files`` and ACK with
+      ``activity_files`` and ACK with status=0.
+    * ``ALL_DEL`` (op=6): clear ``activity_files`` and ACK with
       status=0.
 
     Returns ``None`` for ``LIST_NUM_GET`` and ``AUTO_UPLOAD`` ops —
@@ -273,7 +273,7 @@ async def _handle_cycling_data(
     if op == cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_GET:
         reply = cycling_data_pb2.cycling_data_msg()
         reply.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_SEND
-        for f in state.ride_files:
+        for f in state.activity_files:
             entry = reply.cycling_data_file_flag_msg.add()
             entry.timestamp = f.timestamp
             entry.file_size = f.file_size
@@ -290,7 +290,7 @@ async def _handle_cycling_data(
         if not flags:
             return None
         timestamp = flags[0].timestamp
-        target = next((f for f in state.ride_files if f.timestamp == timestamp), None)
+        target = next((f for f in state.activity_files if f.timestamp == timestamp), None)
         # The simulator hands the transmit-complete stream back
         # through a sentinel return value the dispatcher recognises;
         # see :meth:`Simulator._handle_one`.
@@ -311,7 +311,7 @@ async def _handle_cycling_data(
         )
         if flags:
             target_ts = flags[0].timestamp
-            state.ride_files = [f for f in state.ride_files if f.timestamp != target_ts]
+            state.activity_files = [f for f in state.activity_files if f.timestamp != target_ts]
         return _ConfirmReply(
             service=common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA,
             operation=op,
@@ -326,7 +326,7 @@ async def _handle_cycling_data(
                 operation=op,
                 status=6,
             )  # type: ignore[return-value]
-        state.ride_files = []
+        state.activity_files = []
         return _ConfirmReply(
             service=common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA,
             operation=op,
@@ -353,7 +353,7 @@ class _ConfirmReply:
 class _TransmitCompleteReply:
     """Sentinel: dispatcher should emit a transmit-complete download stream."""
 
-    target: SimulatedRideFile | None
+    target: SimulatedActivityFile | None
 
 
 async def _handle_route_plan(
@@ -429,7 +429,7 @@ async def _handle_factory(
     recorded-activity flash, then ACKs with a status byte.
 
     The simulator does the same — appends to
-    :attr:`SimulatorState.ride_files` so the next ``LIST_GET`` /
+    :attr:`SimulatorState.activity_files` so the next ``LIST_GET`` /
     ``FILE_GET`` round-trip sees them — but only when
     ``allow_destructive=True``. Without the opt-in the simulator
     refuses with ``status=6`` (UnsupportedCommand), mirroring the
@@ -456,14 +456,14 @@ async def _handle_factory(
     # Stagger timestamps so each synthetic entry is uniquely
     # addressable by FILE_GET / FILE_DEL — the device's flash uses
     # the FIT start-timestamp as the on-wire id.
-    used = {entry.timestamp for entry in state.ride_files}
+    used = {entry.timestamp for entry in state.activity_files}
     for i in range(count):
         ts = base + i
         while ts in used:
             ts += 1
         used.add(ts)
-        state.ride_files.append(
-            SimulatedRideFile(
+        state.activity_files.append(
+            SimulatedActivityFile(
                 timestamp=ts,
                 file_size=size,
                 content=_make_fake_fit(size),
@@ -689,7 +689,7 @@ class Simulator:
         )
         await self._transport.send(framing.build_frame(out_frame))
 
-    async def _send_activity_file(self, target: SimulatedRideFile | None) -> None:
+    async def _send_activity_file(self, target: SimulatedActivityFile | None) -> None:
         """Emit a transmit-complete CYCLING_DATA FILE_SEND stream for *target*.
 
         Mirrors the BSC200 firmware's observed wire format byte-for-byte

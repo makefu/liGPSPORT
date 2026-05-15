@@ -269,8 +269,8 @@ service follows the same wire shape:
 
 ### 6.4 CYCLING_DATA (service 6) — recorded activities
 
-The BSC200 calls a recorded ride an **Activity** (the Android app's
-vocabulary is consistent: ``HistoryActivity``,
+The BSC200 calls a recorded activity an **Activity** (the Android
+app's vocabulary is consistent: ``HistoryActivity``,
 ``readActivityList``, ``readActivityFitFile``,
 ``deleteActivityFitFile``). Every activity is stored on the device
 as a Garmin **FIT** file keyed by a uint32 *timestamp* — that value
@@ -396,7 +396,7 @@ no-ops it. Other iGS / BSC variants may honour the op; the
 library returns the wire status byte unchanged so callers can
 distinguish ack-from-implementation. To populate the activity
 list for e2e tests on a BSC200, the user has to physically
-record a short ride.
+record a short activity.
 
 ### 6.10 BLE (service 10)
 
@@ -421,7 +421,7 @@ protobuf payload is the service's container message with the chunk
 bytes in its `file_content` field. The 20-byte header carries an
 incrementing `file_tag` (offset 3) per chunk.
 
-**Download** (e.g. ride file):
+**Download** (e.g. activity file):
 
 1. App sends ``cycling_data_msg`` with ``FILE_GET=3`` and a
    ``cycling_data_file_flag_message`` identifying the file.
@@ -756,9 +756,9 @@ the blocker for end-to-end uploads, not the BLE transport. A
 authenticated user session) but is a clean follow-on.
 
 :mod:`ligpsport.file_transfer` also exposes
-:func:`download_cycling_data` for the read direction (verified
-against the in-tree simulator; the BSC200 has no recorded rides on
-hand to verify against the live device).
+:func:`download_activity` for the read direction (verified
+against the in-tree simulator; the BSC200 has no recorded
+activities on hand to verify against the live device).
 
 ### 7.2 Starting navigation — ROUTE_PLAN FILE_USE
 
@@ -1015,12 +1015,11 @@ gen ≤ 3 devices take body-on-data + header-on-control.
 
 ### 7.5 Listing, downloading, and deleting activities
 
-The BSC200 keeps recorded rides as Garmin **FIT** files in flash
-under the **CYCLING_DATA** service (§6.4). The iGPSPORT app
+The BSC200 keeps recorded activities as Garmin **FIT** files in
+flash under the **CYCLING_DATA** service (§6.4). The iGPSPORT app
 exposes them as *Activities*; the library matches that vocabulary
-(``list-activities`` / ``download-activity`` / ``del-activity``,
-with the older ``rides`` / ``get-ride`` / ``delete-ride`` names
-preserved as aliases). All three operations share two non-obvious
+(``list-activities`` / ``download-activity`` / ``del-activity`` /
+``del-all-activities``). All four operations share two non-obvious
 wire details that differ from the documented enums and from
 ROUTE_PLAN's chunked uploads:
 
@@ -1191,7 +1190,7 @@ protocol's intent. Live-verified: a single merged write returns
 A ``FILE_DEL`` request targeting an existing activity returns
 ``status=0`` and the entry is gone from the next ``LIST_GET``.
 Live-verified 2026-05-16 against firmware 2024-05-14: a freshly
-recorded ride was listed, ``FILE_DEL`` ack'd with ``status=0``,
+recorded activity was listed, ``FILE_DEL`` ack'd with ``status=0``,
 and the next ``LIST_GET`` returned an empty list.
 
 | Op | Wire status | Effect on device |
@@ -1210,7 +1209,7 @@ and the next ``LIST_GET`` returned an empty list.
 > stale ``LIST_GET`` while still parked or replying with a
 > zeroed-out frame from the wedged state. There is **no
 > firmware-level active-file protection** for activities — every
-> ride listed by ``LIST_GET`` is deletable with ``FILE_DEL``.
+> activity listed by ``LIST_GET`` is deletable with ``FILE_DEL``.
 
 The library's :func:`file_transfer.delete_activity` returns the
 status byte; the CLI's ``del-activity`` still wraps it with a
@@ -1249,7 +1248,7 @@ above (no new framing):
 * :func:`file_transfer.list_activities` ↔ ``list-activities``
 * :func:`file_transfer.download_activity` ↔ ``download-activity``
 * :func:`file_transfer.delete_activity` ↔ ``del-activity``
-* :func:`file_transfer.delete_all_activities` ↔ ``delete-all-rides``
+* :func:`file_transfer.delete_all_activities` ↔ ``del-all-activities``
 
 The library also offers two ergonomic wrappers that don't add new
 wire ops:
@@ -1268,8 +1267,8 @@ wire ops:
 For destructive e2e testing, ``sim-activity count=N size=BYTES``
 exposes FACTORY/SIM_FIT_SET (§6.9) — but as documented there, the
 BSC200 firmware in scope here acks the op without materialising
-the files. On a BSC200 you still need to physically record a ride
-to populate the activity list.
+the files. On a BSC200 you still need to physically record a
+short activity to populate the activity list.
 
 ## 8. Destructive operations
 
@@ -1287,7 +1286,7 @@ on the device. They are listed verbatim in
 | 4 (FIRMWARE)     | 3 (MCU_UPDATE) | Initiates an MCU firmware flash.            |
 | 4 (FIRMWARE)     | 5 (BLE_UPDATE) | Initiates a BLE firmware flash.            |
 | 11 (FACTORY)     | 3 (SN_SET)   | Overwrites the device serial number.           |
-| 11 (FACTORY)     | 7 (SIM_FIT_SET) | Generates a fake ride file in flash.        |
+| 11 (FACTORY)     | 7 (SIM_FIT_SET) | Generates a fake activity file in flash.    |
 
 These are also refused by the simulator's
 ``SimulatorState.allow_destructive`` guardrail unless explicitly

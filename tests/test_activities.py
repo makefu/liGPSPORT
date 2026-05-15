@@ -30,7 +30,7 @@ from ligpsport.commands import (
     run_named,
 )
 from ligpsport.simulator import (
-    SimulatedRideFile,
+    SimulatedActivityFile,
     Simulator,
     SimulatorState,
 )
@@ -65,8 +65,8 @@ def _make_fit_bytes(size: int) -> bytes:
 def state_with_one_activity() -> SimulatorState:
     """A simulator state holding one recorded activity."""
     return SimulatorState(
-        ride_files=[
-            SimulatedRideFile(
+        activity_files=[
+            SimulatedActivityFile(
                 timestamp=1147795610,
                 file_size=512,
                 user_id="user-42",
@@ -85,8 +85,8 @@ def state_with_real_activity() -> SimulatorState:
     the real FIT records — synthetic bytes only carry the magic.
     """
     return SimulatorState(
-        ride_files=[
-            SimulatedRideFile(
+        activity_files=[
+            SimulatedActivityFile(
                 timestamp=_REAL_TIMESTAMP,
                 file_size=len(_REAL_FIT_BYTES),
                 user_id="user-42",
@@ -101,22 +101,22 @@ def state_with_real_activity() -> SimulatorState:
 def state_with_three_real_activities() -> SimulatorState:
     """Three activities, all carrying the real FIT payload at different timestamps."""
     return SimulatorState(
-        ride_files=[
-            SimulatedRideFile(
+        activity_files=[
+            SimulatedActivityFile(
                 timestamp=_REAL_TIMESTAMP - 200,
                 file_size=len(_REAL_FIT_BYTES),
                 user_id="user-42",
                 device_id="BSC200-test",
                 content=_REAL_FIT_BYTES,
             ),
-            SimulatedRideFile(
+            SimulatedActivityFile(
                 timestamp=_REAL_TIMESTAMP - 100,
                 file_size=len(_REAL_FIT_BYTES),
                 user_id="user-42",
                 device_id="BSC200-test",
                 content=_REAL_FIT_BYTES,
             ),
-            SimulatedRideFile(
+            SimulatedActivityFile(
                 timestamp=_REAL_TIMESTAMP,
                 file_size=len(_REAL_FIT_BYTES),
                 user_id="user-42",
@@ -131,18 +131,18 @@ def state_with_three_real_activities() -> SimulatorState:
 def state_with_three_activities() -> SimulatorState:
     """Three activities — drives the multi-entry listing path."""
     return SimulatorState(
-        ride_files=[
-            SimulatedRideFile(
+        activity_files=[
+            SimulatedActivityFile(
                 timestamp=1147000000,
                 file_size=1024,
                 content=_make_fit_bytes(1024),
             ),
-            SimulatedRideFile(
+            SimulatedActivityFile(
                 timestamp=1147500000,
                 file_size=512,
                 content=_make_fit_bytes(512),
             ),
-            SimulatedRideFile(
+            SimulatedActivityFile(
                 timestamp=1147795610,
                 file_size=2048,
                 content=_make_fit_bytes(2048),
@@ -213,19 +213,6 @@ async def test_download_activity_with_three_in_list(
     assert result.content[8:12] == b".FIT"
 
 
-async def test_download_cycling_data_legacy_alias(
-    state_with_one_activity: SimulatorState,
-) -> None:
-    """The old ``download_cycling_data`` name still returns the file bytes."""
-    client_t, peer_t = make_loopback_pair()
-    async with Simulator(peer_t, state_with_one_activity), IgpsportClient(client_t) as client:
-        data = await file_transfer.download_cycling_data(
-            client, timestamp=1147795610, expected_size=512
-        )
-    assert len(data) == 512
-    assert data[8:12] == b".FIT"
-
-
 async def test_delete_activity_drops_from_list(
     state_with_three_activities: SimulatorState,
 ) -> None:
@@ -253,8 +240,8 @@ async def test_delete_activity_destructive_gate_refused() -> None:
     disappear from the list.
     """
     state = SimulatorState(
-        ride_files=[
-            SimulatedRideFile(timestamp=1147795610, file_size=10, content=b"x" * 10),
+        activity_files=[
+            SimulatedActivityFile(timestamp=1147795610, file_size=10, content=b"x" * 10),
         ]
     )
     client_t, peer_t = make_loopback_pair()
@@ -357,8 +344,20 @@ async def test_del_activity_command_is_destructive() -> None:
     spec = get_command("del-activity")
     assert spec.destructive is True
     assert spec.danger is not None
-    # Same for the legacy alias.
-    assert get_command("delete-ride").destructive is True
+
+
+async def test_del_all_activities_command_is_destructive() -> None:
+    """The registry entry is marked destructive and refuses without the gate."""
+    from ligpsport.commands import DestructiveCommandError, get_command
+
+    spec = get_command("del-all-activities")
+    assert spec.destructive is True
+    assert spec.danger is not None
+
+    client_t, peer_t = make_loopback_pair()
+    async with Simulator(peer_t, SimulatorState()), IgpsportClient(client_t) as client:
+        with pytest.raises(DestructiveCommandError):
+            await run_named(client, "del-all-activities")
 
 
 async def test_sim_activity_gated() -> None:
@@ -403,7 +402,7 @@ async def test_sim_activity_creates_entries(tmp_path) -> None:
     assert result.value.count == 2
     assert result.value.size_bytes == 2048
     assert result.value.status == 0
-    assert len(state.ride_files) == 2
+    assert len(state.activity_files) == 2
     for path in out_paths:
         data = path.read_bytes()
         assert data[8:12] == b".FIT"
@@ -428,7 +427,7 @@ async def test_download_activity_type_gpx(
     The real captured FIT carries 421 records with GPS — the rendered
     GPX must parse and contain at least one ``<trkpt>``.
     """
-    out = tmp_path / "ride.gpx"
+    out = tmp_path / "activity.gpx"
     client_t, peer_t = make_loopback_pair()
     async with Simulator(peer_t, state_with_real_activity), IgpsportClient(client_t) as client:
         result = await run_named(
@@ -575,18 +574,18 @@ def state_with_three_distinct_activities() -> SimulatorState:
     fit_b = _patch_fit_time_created(_REAL_FIT_BYTES, garmin_seconds=base + 3600)
     fit_c = _patch_fit_time_created(_REAL_FIT_BYTES, garmin_seconds=base + 7200)
     return SimulatorState(
-        ride_files=[
-            SimulatedRideFile(
+        activity_files=[
+            SimulatedActivityFile(
                 timestamp=base,
                 file_size=len(fit_a),
                 content=fit_a,
             ),
-            SimulatedRideFile(
+            SimulatedActivityFile(
                 timestamp=base + 3600,
                 file_size=len(fit_b),
                 content=fit_b,
             ),
-            SimulatedRideFile(
+            SimulatedActivityFile(
                 timestamp=base + 7200,
                 file_size=len(fit_c),
                 content=fit_c,
@@ -682,7 +681,7 @@ async def test_download_activity_legacy_default_is_fit(
     Back-compat guarantee for scripts that already use the
     ``download-activity <ts> <path>`` two-positional form.
     """
-    out = tmp_path / "ride.fit"
+    out = tmp_path / "activity.fit"
     client_t, peer_t = make_loopback_pair()
     async with Simulator(peer_t, state_with_one_activity), IgpsportClient(client_t) as client:
         result = await run_named(

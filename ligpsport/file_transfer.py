@@ -1,8 +1,9 @@
 """Chunked file upload / download helpers for the iGPSPORT BLE protocol.
 
-For **downloads** (e.g. recorded ride files), the client issues a
-``FILE_GET`` request that identifies the file (by timestamp for rides,
-by id for routes). The device then streams ``FILE_SEND`` frames until
+For **downloads** (e.g. recorded activity files), the client issues a
+``FILE_GET`` request that identifies the file (by timestamp for
+activities, by id for routes). The device then streams ``FILE_SEND``
+frames until
 the requested file size is satisfied. The library accumulates
 ``file_content`` bytes until the cumulative count matches the size
 reported by the preceding LIST_GET (or by the ``file_size`` field in
@@ -51,8 +52,8 @@ in ``docs/PROTOCOL.md`` §7. Summary, per chunk:
    ``setRoutePlanFile`` in the smali, which the app always invokes
    after a successful ``sendRoutePlanFile``.
 
-This module exposes :func:`download_cycling_data` and
-:func:`upload_route_plan`. The CLI's ``get-ride`` and
+This module exposes :func:`download_activity` and
+:func:`upload_route_plan`. The CLI's ``download-activity`` and
 ``upload-route`` subcommands sit on top of them.
 """
 
@@ -234,31 +235,6 @@ class ActivityDownload:
     file_size: int
     file_id: int
     file_name: str
-
-
-async def download_cycling_data(
-    client: IgpsportClient,
-    *,
-    timestamp: int,
-    expected_size: int | None = None,
-    chunk_timeout: float = 10.0,
-    overall_timeout: float = 300.0,
-) -> bytes:
-    """Download one recorded activity file from the device (FIT bytes).
-
-    Thin wrapper around :func:`download_activity` for callers that only
-    want the file content. *expected_size* is accepted for backwards
-    compatibility but ignored — the embedded ``file_download`` protobuf
-    carries the authoritative length, and the transmit-complete
-    framing path always returns a complete file or raises.
-    """
-    del expected_size  # tolerated for backwards compat; size comes from device
-    result = await download_activity(
-        client,
-        timestamp=timestamp,
-        timeout=max(overall_timeout, chunk_timeout),
-    )
-    return result.content
 
 
 async def download_activity(
@@ -533,7 +509,7 @@ async def simulate_fit_files(
     recorded-activity flash (each ~*size_bytes*) and replies with a
     ``DeviceReturnStatus`` byte. **Destructive**: consumes flash
     space; clean up afterwards with ``del-activity`` or
-    ``delete-all-rides``.
+    ``del-all-activities``.
     """
     request = factory_pb2.factory_msg()
     request.factory_operate_type = factory_pb2.enum_FACTORY_OPERATE_TYPE_SIM_FIT_SET
