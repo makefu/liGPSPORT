@@ -6,29 +6,63 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-05-16
+
+The library shipped two parallel CLI vocabularies for recorded
+activities — ``rides``/``get-ride``/``delete-ride``/
+``delete-all-rides`` (v1.0–v1.3) and ``list-activities``/
+``download-activity``/``del-activity`` (v1.4). Both hit the exact
+same CYCLING_DATA wire ops, so carrying both forever would be pure
+maintenance burden. v1.5 keeps only the activity-named spellings
+that match the iGPSPORT app's own vocabulary
+(``HistoryActivity`` / ``readActivityFitFile`` / ...).
+
+### Removed (breaking)
+- CLI: ``rides``, ``get-ride``, ``delete-ride`` and
+  ``delete-all-rides`` are gone. Use ``list-activities``,
+  ``download-activity``, ``del-activity`` and the new
+  ``del-all-activities`` instead. Wire protocol unchanged — the
+  renamed commands hit the exact same CYCLING_DATA ops they
+  always did.
+- ``ligpsport.commands.RideFile`` / ``RideList`` aliases removed;
+  use :class:`commands.ActivityFile` / :class:`commands.ActivityList`.
+- ``ligpsport.simulator.SimulatedRideFile`` renamed to
+  ``SimulatedActivityFile``; ``SimulatorState.ride_files`` renamed
+  to ``activity_files``.
+- ``ligpsport.file_transfer.download_cycling_data`` thin wrapper
+  removed; call :func:`file_transfer.download_activity` directly
+  (returns an :class:`ActivityDownload`; use ``.content`` for the
+  FIT bytes).
+
+### Added
+- ``del-all-activities`` CLI command — same wire op as the old
+  ``delete-all-rides`` (CYCLING_DATA ``ALL_DEL`` op=6); the
+  rename brings it in line with the rest of the activity
+  vocabulary.
+
 ### Fixed
 - ``download-all-activities`` now derives each output filename from
   the FIT ``file_id.time_created`` UTC stamp, matching the
   single-file ``download-activity`` path. Earlier it used the
   CYCLING_DATA listing's ``timestamp`` field, which on BSC200
   firmware 2024-05-14 is encoded in local time (CEST) and produced
-  filenames 2h apart from the single-file path for the same ride.
+  filenames 2h apart from the single-file path for the same activity.
 
 ### Changed
 - ``tests/test_bsc200_live.py`` documents that destructive ops
-  (``sim-activity`` / ``del-activity`` / ``delete-all-rides``) are
-  deliberately excluded from the live smoke suite so the suite is
-  safe to re-run repeatedly without manual prep. Destructive paths
-  remain covered against the in-tree simulator in
+  (``sim-activity`` / ``del-activity`` / ``del-all-activities``)
+  are deliberately excluded from the live smoke suite so the suite
+  is safe to re-run repeatedly without manual prep. Destructive
+  paths remain covered against the in-tree simulator in
   ``tests/test_activities.py`` and are live-verified once per
   release as a manual checklist item.
 
 ### Documentation
-- README gains a short "rides vs. activities" terminology note
-  explaining that the ``rides`` / ``get-ride`` / ``delete-ride`` /
-  ``delete-all-rides`` CLI names (v1.0–v1.3) and the
-  ``list-activities`` / ``download-activity`` / ``del-activity``
-  names (v1.4+) hit the exact same wire ops and are interchangeable.
+- README's "Terminology: rides vs. activities" section is gone —
+  with the duplicate vocabulary removed, the note no longer has
+  anything to disambiguate. ``docs/PROTOCOL.md`` §7.5 drops its
+  "older ``rides`` / ``get-ride`` / ``delete-ride`` names
+  preserved as aliases" parenthetical.
 
 ## [1.4.0] — 2026-05-16
 
