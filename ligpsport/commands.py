@@ -1486,15 +1486,17 @@ async def _r_download_all_activities(
         fit_data = activity.content
         fit_magic = len(fit_data) >= 12 and fit_data[8:12] == b".FIT"
         meta, records = fit_activity.read_activity_fit(fit_data)
-        # Use the **listing** timestamp rather than meta.time_created
-        # so each activity gets a unique on-disk name — protects against
-        # firmware quirks (or simulator bulk-fakes) that share a FIT
-        # creation time across files in the same flash slot.
-        target = out_dir / fit_activity.activity_filename(
-            timestamp=listing.timestamp,
-            device_model=meta.device_model,
-            extension=file_type,
-        )
+        # Derive the filename from the FIT's ``time_created`` — UTC,
+        # same as the single-file ``download-activity`` path. Earlier
+        # versions of this runner used the CYCLING_DATA listing's
+        # ``timestamp`` field instead, which on BSC200 firmware
+        # 2024-05-14 turned out to be local time (CEST) encoded as
+        # Garmin-epoch seconds: the bulk-derived names landed 2 h
+        # apart from the single-file names for the same ride. Two
+        # downloads of the same activity should produce identical
+        # filenames regardless of which CLI path you took — and they
+        # should both be UTC. Verified live 2026-05-16.
+        target = out_dir / fit_activity.activity_filename_from_meta(meta, file_type)
         if target.exists():
             skipped.append(str(target))
             continue

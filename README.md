@@ -41,6 +41,19 @@ spec).
 `nix build .#default` runs ruff + format + 50 unit tests. The
 optional `nix flake check` adds a strict mypy pass.
 
+### Terminology: rides vs. activities
+
+The CYCLING_DATA service (PROTOCOL.md §6.4) stores each recorded
+ride as a Garmin **FIT** file the iGPSPORT app calls an *Activity*
+(``HistoryActivity``, ``readActivityFitFile``, ...). v1.0–v1.3 of
+this library shipped CLI commands named after "rides" (``rides``,
+``get-ride``, ``delete-ride``, ``delete-all-rides``); v1.4
+introduced the matching ``list-activities`` / ``download-activity`` /
+``del-activity`` names that align with the upstream vocabulary. Both
+spellings hit the exact same wire ops on the exact same service and
+are interchangeable — pick whichever reads better. The
+``activities`` spelling is preferred in new docs and scripts.
+
 ## Quickstart
 
 ```sh

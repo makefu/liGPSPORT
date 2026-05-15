@@ -6,6 +6,30 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- ``download-all-activities`` now derives each output filename from
+  the FIT ``file_id.time_created`` UTC stamp, matching the
+  single-file ``download-activity`` path. Earlier it used the
+  CYCLING_DATA listing's ``timestamp`` field, which on BSC200
+  firmware 2024-05-14 is encoded in local time (CEST) and produced
+  filenames 2h apart from the single-file path for the same ride.
+
+### Changed
+- ``tests/test_bsc200_live.py`` documents that destructive ops
+  (``sim-activity`` / ``del-activity`` / ``delete-all-rides``) are
+  deliberately excluded from the live smoke suite so the suite is
+  safe to re-run repeatedly without manual prep. Destructive paths
+  remain covered against the in-tree simulator in
+  ``tests/test_activities.py`` and are live-verified once per
+  release as a manual checklist item.
+
+### Documentation
+- README gains a short "rides vs. activities" terminology note
+  explaining that the ``rides`` / ``get-ride`` / ``delete-ride`` /
+  ``delete-all-rides`` CLI names (v1.0–v1.3) and the
+  ``list-activities`` / ``download-activity`` / ``del-activity``
+  names (v1.4+) hit the exact same wire ops and are interchangeable.
+
 ## [1.4.0] — 2026-05-16
 
 Activity downloads gain format conversion, bulk pull, and an

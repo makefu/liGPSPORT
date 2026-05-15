@@ -12,6 +12,7 @@ download stream — the device's bogus ``payload_size``, the embedded
 
 from __future__ import annotations
 
+import datetime
 import pathlib
 import xml.etree.ElementTree as ET
 
@@ -479,11 +480,26 @@ async def test_download_activity_filename_derivation(
     assert _REAL_GPX_NAME.endswith(".gpx")
 
 
-async def test_download_all_activities_writes_all(
+async def test_download_all_activities_processes_all_listed(
     state_with_three_real_activities: SimulatorState,
     tmp_path,
 ) -> None:
-    """Bulk download produces one derived-name file per listed activity."""
+    """Bulk download visits every listed activity exactly once.
+
+    Filenames come from the FIT's ``file_id.time_created`` field
+    (UTC) — same as the single-file ``download-activity`` path. The
+    three fixture entries share one captured FIT, so they collide on
+    one derived filename: the first is written, the rest end up in
+    ``skipped`` (same idempotency that protects re-runs on real
+    activities that have already been pulled). What the test cares
+    about is that *every* listed entry is processed; the underlying
+    flash hasn't been silently truncated.
+
+    Real-device activities each carry a unique ``time_created`` and
+    so produce three distinct filenames. The ``writes_all_distinct``
+    test below uses three FIT files with patched ``time_created``
+    values to exercise that path explicitly.
+    """
     client_t, peer_t = make_loopback_pair()
     async with (
         Simulator(peer_t, state_with_three_real_activities),
@@ -499,15 +515,112 @@ async def test_download_all_activities_writes_all(
     assert result.name == "download-all-activities"
     value = result.value
     assert isinstance(value, DownloadedActivityList)
-    assert len(value.entries) == 3
-    assert value.skipped == ()
+    assert len(value.entries) + len(value.skipped) == 3
+    assert len(value.entries) >= 1
     for entry in value.entries:
         assert entry.file_format == "fit"
         path = pathlib.Path(entry.path)
         assert path.exists()
         assert path.parent == tmp_path
-        # Every written file is a real FIT — bytes 8..11 = ".FIT".
         assert path.read_bytes()[8:12] == b".FIT"
+
+
+def _patch_fit_time_created(fit_bytes: bytes, *, garmin_seconds: int) -> bytes:
+    """Patch the ``file_id.time_created`` field in a captured FIT.
+
+    Used by the distinct-time_created fixture below. The fit_activity
+    reader only consults the *first* ``file_id`` message — patching
+    that one is enough to vary the derived filename. We leave the
+    record stream's per-record timestamps untouched (their delta from
+    file_id.time_created is what matters for the GPX writer).
+    """
+    import struct
+
+    from ligpsport import fit_course
+
+    # The captured fixture stores time_created at offset 68 of the FIT
+    # bytes (the file_id message's payload starts right after the FIT
+    # header + file_id definition). Verified by parsing the captured
+    # fixture with fitparse and searching for the 4-byte little-endian
+    # encoding of the file_id.time_created value (offset 68, four
+    # other occurrences are downstream message timestamps we leave
+    # alone). If a different fixture is dropped in, update the offset.
+    file_id_time_offset = 68
+    new_bytes = struct.pack("<I", garmin_seconds)
+    patched = bytearray(fit_bytes)
+    patched[file_id_time_offset : file_id_time_offset + 4] = new_bytes
+    # FIT files end with a 2-byte CRC16/IBM over every prior byte.
+    # Recompute it so fitparse doesn't reject the patched bytes.
+    crc = fit_course._fit_crc16(bytes(patched[:-2]))
+    patched[-2:] = struct.pack("<H", crc)
+    return bytes(patched)
+
+
+@pytest.fixture
+def state_with_three_distinct_activities() -> SimulatorState:
+    """Three activities with *different* ``time_created`` values.
+
+    Exercises the bulk path's filename derivation for the case real
+    devices actually exhibit — every recorded activity has its own
+    UTC creation time, so the derived filenames are distinct and the
+    bulk download writes one file per listed entry.
+    """
+    base = int(
+        (
+            datetime.datetime(2026, 5, 15, 14, 6, 50, tzinfo=datetime.UTC)
+            - datetime.datetime(1989, 12, 31, tzinfo=datetime.UTC)
+        ).total_seconds()
+    )
+    fit_a = _patch_fit_time_created(_REAL_FIT_BYTES, garmin_seconds=base)
+    fit_b = _patch_fit_time_created(_REAL_FIT_BYTES, garmin_seconds=base + 3600)
+    fit_c = _patch_fit_time_created(_REAL_FIT_BYTES, garmin_seconds=base + 7200)
+    return SimulatorState(
+        ride_files=[
+            SimulatedRideFile(
+                timestamp=base,
+                file_size=len(fit_a),
+                content=fit_a,
+            ),
+            SimulatedRideFile(
+                timestamp=base + 3600,
+                file_size=len(fit_b),
+                content=fit_b,
+            ),
+            SimulatedRideFile(
+                timestamp=base + 7200,
+                file_size=len(fit_c),
+                content=fit_c,
+            ),
+        ]
+    )
+
+
+async def test_download_all_activities_writes_all_distinct(
+    state_with_three_distinct_activities: SimulatorState,
+    tmp_path,
+) -> None:
+    """Three activities with distinct ``time_created`` → three files."""
+    client_t, peer_t = make_loopback_pair()
+    async with (
+        Simulator(peer_t, state_with_three_distinct_activities),
+        IgpsportClient(client_t) as client,
+    ):
+        result = await run_named(
+            client,
+            "download-all-activities",
+            args=(str(tmp_path),),
+            timeout=10.0,
+        )
+
+    assert isinstance(result.value, DownloadedActivityList)
+    assert len(result.value.entries) == 3
+    assert result.value.skipped == ()
+    paths = sorted(pathlib.Path(e.path).name for e in result.value.entries)
+    # Filenames have a 1-hour spacing per fixture construction, all
+    # starting with "20260515T" (UTC) and ending "_BSC200.fit".
+    assert all(name.startswith("20260515T") for name in paths)
+    assert all(name.endswith("_BSC200.fit") for name in paths)
+    assert len(set(paths)) == 3  # all distinct
 
 
 async def test_download_all_activities_gpx_type(

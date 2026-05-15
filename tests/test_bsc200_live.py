@@ -5,7 +5,25 @@ Skipped by default. To run against a real BSC200::
     LIGPSPORT_DEVICE_ADDRESS=AA:BB:CC:DD:EE:FF \\
       nix develop --command pytest -q -m bsc200 tests/test_bsc200_live.py
 
-These tests only cover non-destructive read paths — see AGENTS.md §2.
+These tests cover **read-only paths only**. Destructive ops
+(``sim-activity`` / ``del-activity`` / ``delete-all-rides``) are
+deliberately excluded so the suite is safe to re-run repeatedly
+without manual prep. The destructive paths are exercised against
+the in-tree simulator in ``tests/test_activities.py`` and live-
+verified once per release as part of the release-engineer's
+checklist (PROTOCOL.md §7.5, the FILE_DEL retest); they are *not*
+auto-runnable here because:
+
+* Deleting the device's lone recorded activity wipes the test
+  target for every subsequent live run, forcing the engineer to
+  manually record a new ride before the suite can pass again.
+* ``sim-activity`` acks ``status=0`` on BSC200 firmware
+  2024-05-14 but silently no-ops, so it can't seed a replacement
+  activity either (PROTOCOL.md §6.9). Until iGPSPORT firmware
+  actually honours SIM_FIT_SET, the destructive cycle costs a
+  human ride.
+
+See AGENTS.md §2 for the broader destructive policy.
 """
 
 from __future__ import annotations
