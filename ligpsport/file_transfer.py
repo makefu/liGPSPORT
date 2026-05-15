@@ -144,6 +144,14 @@ _ROUTE_PLAN_FILE_TYPE_BY_EXT: Final[dict[str, int]] = {
 
 # Friendly names for the device-status byte. Keeps error messages
 # readable; the integer is still authoritative.
+#
+# Source: `com.igpsport.blelib.DeviceReturnStatus` smali enum init
+# (DeviceReturnStatus.smali line 145-260). The first 7 entries map
+# directly (ordinal == wire byte); the Wifi block jumps to 16-23 and
+# the Navigation block to 65-66. We had values 7-16 wrong in earlier
+# releases — verified against snoop_start.log where a FILE_USE for a
+# not-yet-uploaded route returns status byte 0x42 = 66 =
+# NavigationRouteDoesNotExist.
 _STATUS_NAMES: Final[dict[int, str]] = {
     0: "Success",
     1: "DataError",
@@ -152,16 +160,16 @@ _STATUS_NAMES: Final[dict[int, str]] = {
     4: "QuantityIsFull",
     5: "IsBeingUsed",
     6: "UnsupportedCommand",
-    7: "WifiConnectionSucceeded",
-    8: "WifiWrongPassword",
-    9: "WifiConnectionTimedOut",
-    10: "WifiNotConnected",
-    11: "WifiPleaseEnterPassword",
-    12: "WifiMapDownload",
-    13: "WifiFirmwareDownload",
-    14: "WifiCyclingActivityIsUploading",
-    15: "NavigationRouteDeletionFailed",
-    16: "NavigationRouteDoesNotExist",
+    16: "WifiConnectionSucceeded",
+    17: "WifiWrongPassword",
+    18: "WifiConnectionTimedOut",
+    19: "WifiNotConnected",
+    20: "WifiPleaseEnterPassword",
+    21: "WifiMapDownload",
+    22: "WifiFirmwareDownload",
+    23: "WifiCyclingActivityIsUploading",
+    65: "NavigationRouteDeletionFailed",
+    66: "NavigationRouteDoesNotExist",
 }
 
 
@@ -376,13 +384,29 @@ def _route_chunks(data: bytes, chunk_size: int) -> list[bytes]:
     return [data[i * chunk_size : (i + 1) * chunk_size] for i in range(n)]
 
 
-def _build_file_use_pb(*, file_id: int, file_extension: str) -> bytes:
+def _build_file_use_pb(
+    *,
+    file_id: int,
+    file_extension: str,
+    name: str | None = None,
+    total_distance: int = 0,
+) -> bytes:
     """Build a route_plan_data_msg with operate_type=FILE_USE.
 
-    Mirrors `IGPDeviceManager.setRoutePlanFile` (smali 27391-27430):
-    one line_id of ``"<file_id>.<ext>"`` and one info_msg with id +
-    file_type. No file_content. This is the **commit / use** command
-    sent after all FILE_SEND chunks finish.
+    Mirrors ``IGPDeviceManager.setRoutePlanFile`` (smali 27391-27430)
+    cross-referenced with a btsnoop capture of the live app — the
+    captured wire body carries four fields in the nested
+    ``route_plan_info_msg``: ``id``, ``file_type``, ``name``,
+    ``total_distance``. The smali only wires ``id`` and ``file_type``
+    explicitly; ``name`` and ``total_distance`` come from the
+    ``RoutePlanData`` constructor's defaults (the file's display
+    name and 0 respectively). The BSC200 firmware appears to
+    validate the ``name`` field — omitting it yields a malformed
+    FILE_USE that the device silently ignores.
+
+    *name* defaults to ``str(file_id)`` (matches the app's behaviour
+    for unnamed routes; the capture showed ``name="235679"`` for
+    ``file_id=235679``). *total_distance* defaults to 0.
     """
     msg = route_plan_pb2.route_plan_data_msg()
     msg.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN
@@ -394,6 +418,8 @@ def _build_file_use_pb(*, file_id: int, file_extension: str) -> bytes:
         file_extension.lower(),
         route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_INVALID,
     )
+    info.name = name if name is not None else str(file_id)
+    info.total_distance = total_distance
     return bytes(msg.SerializeToString())
 
 
@@ -430,32 +456,47 @@ async def _send_file_use(
     file_extension: str,
     generation: int,
     timeout: float,
+    name: str | None = None,
+    total_distance: int = 0,
     existing_queue: asyncio.Queue[object] | None = None,
 ) -> int:
     """Send a ``ROUTE_PLAN FILE_USE`` and return the device's status byte.
 
-    Mirrors :samp:`IGPDeviceManager.setRoutePlanFile` (smali line
-    27391). After a successful upload, FILE_USE is what tells the
-    device to switch its active route and enter navigation mode —
-    the iGPSPORT Android app issues this from
-    ``RoadBookSearchActivity.useRoutePlan`` (CNX path) and from the
-    ``sendFileToDevice`` flow (FILE_OPERATION path) whenever the user
-    chose "send and use", and confirms success by toasting
-    ``使用线路 status = 0``.
+    Mirrors ``IGPDeviceManager.setRoutePlanFile`` (smali 27391) and
+    validated against a live btsnoop capture of the iGPSPORT app's
+    "Start navigation" tap on the BSC200 (``docs/PROTOCOL.md`` §7.2).
+    The captured wire format is **a single write of header || body to
+    the fourth characteristic** (``…-6e``, channel 4) — not the
+    two-channel split (body to data + header to control) used by the
+    chunked FILE_SEND path. The smali bears this out: for
+    ``getGeneration() == 4`` (the BSC200 in current firmware, despite
+    early docs treating it as gen 3) ``setRoutePlanFile`` calls
+    ``StringUtils.byteMerger(pair.second, pair.first)`` to glue
+    header + body together, and the post-write lambda
+    (``send$lambda-135``) skips the control-channel follow-up. For
+    legacy gen-3 devices the helper falls back to the
+    two-channel split.
 
-    *generation* selects the data channel: ``>= 3`` writes the
-    protobuf body to ``"fourth"`` (``…-6e``), otherwise ``"data"``
-    (``…-9e``). The 20-byte header always goes on ``"control"``.
+    *name* / *total_distance* land in the nested
+    ``route_plan_info_msg``. The BSC200 firmware silently drops a
+    FILE_USE that omits them; the capture shows the app populating
+    ``name=str(file_id)`` and ``total_distance=0`` for unnamed routes.
 
     *existing_queue* lets the chunked-upload path reuse its already-
-    open ROUTE_PLAN subscription so the FILE_USE reply doesn't race a
-    fresh subscriber registration.
+    open ROUTE_PLAN subscription so the FILE_USE reply doesn't race
+    a fresh subscriber registration.
 
-    Returns the device's ``DeviceReturnStatus`` byte (0 = Success).
-    Callers decide whether to raise :class:`NavigationStartError`.
+    Returns the device's ``DeviceReturnStatus`` wire byte (0 =
+    Success; 66 = NavigationRouteDoesNotExist = the route file
+    isn't on the device yet). Callers decide whether to raise
+    :class:`NavigationStartError`.
     """
-    data_channel: Channel = "fourth" if generation >= 3 else "data"
-    use_pb = _build_file_use_pb(file_id=file_id, file_extension=file_extension)
+    use_pb = _build_file_use_pb(
+        file_id=file_id,
+        file_extension=file_extension,
+        name=name,
+        total_distance=total_distance,
+    )
     use_header = _build_file_use_header(use_pb)
     if existing_queue is None:
         queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN)
@@ -464,8 +505,17 @@ async def _send_file_use(
         queue = existing_queue  # type: ignore[assignment]
         owns_queue = False
     try:
-        await client._transport.send(use_pb, channel=data_channel)
-        await client._transport.send(use_header, channel="control")
+        if generation >= 4:
+            # Gen-4 path (BSC200, iGS630): single merged write to the
+            # fourth characteristic. The smali merger order is
+            # ``pair.second + pair.first`` → header + body.
+            await client._transport.send(use_header + use_pb, channel="fourth")
+        else:
+            # Legacy gen-3 path: body on the data-bearing UART, then
+            # the 20-byte header on the control UART.
+            data_channel: Channel = "fourth" if generation >= 3 else "data"
+            await client._transport.send(use_pb, channel=data_channel)
+            await client._transport.send(use_header, channel="control")
         response = await asyncio.wait_for(queue.get(), timeout=timeout)
     finally:
         if owns_queue:
@@ -482,7 +532,7 @@ async def upload_route_plan(
     file_id: int = 1,
     file_extension: str = "gpx",
     chunk_size: int = _DEFAULT_CHUNK_SIZE,
-    generation: int = 3,
+    generation: int = 4,
     device_name: str | None = None,
     timeout: float = 30.0,
     send_file_use: bool = True,
@@ -670,13 +720,18 @@ async def upload_route_plan(
             # newly uploaded route. The app issues this in
             # `setRoutePlanFile` after every successful
             # `sendRoutePlanFile`. On the BSC200 this is also what
-            # actually starts navigation; see PROTOCOL.md §7.2.
+            # actually starts navigation; see PROTOCOL.md §7.2. The
+            # device validates the protobuf's `name` field — pass
+            # the truncated filename we just uploaded under so the
+            # firmware accepts the activation request.
             last_status = await _send_file_use(
                 client,
                 file_id=file_id,
                 file_extension=file_extension,
                 generation=generation,
                 timeout=timeout,
+                name=file_name,
+                total_distance=route.distance_m,
                 existing_queue=queue,
             )
             if start_navigation and last_status not in (_STATUS_OK, _STATUS_DONE_EARLY):
@@ -810,7 +865,7 @@ async def upload_general_file(
     chunk_size: int | None = None,
     timeout: float = 30.0,
     start_navigation: bool = False,
-    generation: int = 3,
+    generation: int = 4,
 ) -> int:
     """Upload *file_bytes* via the FILE_OPERATION ADD path.
 
@@ -885,17 +940,21 @@ async def upload_general_file(
     if status not in (_STATUS_OK, _STATUS_DONE_EARLY):
         raise RouteUploadError(status, 0, n_writes)
     if start_navigation:
-        # The upload landed; now ask the device to activate the route.
-        # ROUTE_PLAN FILE_USE on the same `fourth` channel for gen 3+.
-        # The device firmware switches to navigation mode on
-        # status=0; the iGPSPORT app waits ~5 s here for the
-        # on-device UI to transition before dismissing its dialog.
+        # Upload landed — activate the route. ROUTE_PLAN FILE_USE on
+        # the fourth channel for gen 4+ (single merged write) or
+        # split body/header for legacy gen ≤ 3. The device's UI
+        # transitions into navigation mode on status=0; the iGPSPORT
+        # app waits ~5 s after the ACK before dismissing its dialog.
+        # `file_name` carries the display name the upload protobuf
+        # used — the BSC200 firmware validates this field in the
+        # FILE_USE protobuf and silently drops a request without it.
         nav_status = await _send_file_use(
             client,
             file_id=file_id,
             file_extension=file_extension,
             generation=generation,
             timeout=timeout,
+            name=file_name,
         )
         if nav_status not in (_STATUS_OK, _STATUS_DONE_EARLY):
             raise NavigationStartError(nav_status, file_id)

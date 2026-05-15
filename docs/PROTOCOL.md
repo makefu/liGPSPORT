@@ -667,62 +667,91 @@ enter navigation mode, the iGPSPORT Android app issues a separate
 ``ROUTE_PLAN FILE_USE`` (operate_type=5) after the upload. The smali
 hook is ``IGPDeviceManager.setRoutePlanFile(id, fileType)`` at
 ``c4 line 27391``; the activity-level caller is
-``RoadBookSearchActivity.useRoutePlan`` (and a paired ``sendFileToDevice``
-flow that wraps upload + FILE_USE behind a single "send and use"
-button). The app waits ~5 s after a successful FILE_USE — long enough
-for the on-device UI to transition into the navigation screen — then
-dismisses its dialog.
+``RoadBookSearchActivity.useRoutePlan`` (and the paired
+``sendFileToDevice`` flow that wraps upload + FILE_USE behind a
+single "send and use" button). The app waits ~5 s after a successful
+FILE_USE — long enough for the on-device UI to transition into the
+navigation screen — then dismisses its dialog.
 
-#### Wire format
+#### Wire format (gen-4 / BSC200)
 
-FILE_USE is **a single ROUTE_PLAN frame**, not a chunked stream, but
-the multi-channel split mirrors the FILE_SEND pattern.
+The BSC200 in current firmware reports ``getGeneration() == 4`` and
+takes the **single merged write** branch of the smali's
+``setRoutePlanFile``. Earlier docs (and ligpsport v1.0–v1.1.0) had
+this wrong: the live wire format is **one** write of (20-byte head ‖
+protobuf body) to the fourth characteristic, *not* a body/header
+split across two characteristics. Verified end-to-end against a
+btsnoop capture of the live "Start navigation" button (frames
+35405 / 35545 in ``snoop_start.log``):
 
-``route_plan_data_msg`` protobuf body:
+```
+write_command handle=0x001f (fourth RX, …-6e), 54 bytes:
+  20-byte head:
+    01 07 ff ff 05 ff ff 00 22 f2 01 ff*8 22
+    │  │              │     │  │  │
+    │  │              │     │  │  └── header CRC8(bytes 0..18)
+    │  │              │     │  └───── END_TYPE_PB
+    │  │              │     └──────── payload CRC8(body)
+    │  │              └────────────── BE16 payload_size = 34 (0x0022)
+    │  │              ^^^^^ status byte unused on request side
+    │  │           ^^ operation = FILE_USE (5)
+    │  └─ service = ROUTE_PLAN (7)
+    └──── TYPE_PB
+  34-byte body: route_plan_data_msg protobuf
+```
+
+``route_plan_data_msg`` body, captured from a live "Start" tap:
 
 | Field | Value |
 |-------|-------|
 | ``service_type`` (1) | ``SERVICE_TYPE_INDEX_ROUTE_PLAN`` (7) |
 | ``route_plan_operate_type`` (2) | ``FILE_USE`` (5) |
-| ``line_id`` (3) | one entry: ``"<file_id>.<ext>"`` (e.g. ``"99.cnx"``) |
-| ``route_plan_info_msg`` (5) | one entry with ``id = file_id``, ``file_type = enum_ROUTE_PLAN_FILE_TYPE_CNX`` |
+| ``line_id`` (3) | one entry: ``"<file_id>.<ext>"`` (e.g. ``"235679.cnx"``) |
+| ``route_plan_info_msg`` (5) | one entry, see below |
 
-20-byte head paired with the body:
+Nested ``route_plan_info_msg``:
 
-| Offset | Value | Meaning |
-|-------:|-------|---------|
-| 0 | ``0x01`` | TYPE_PB |
-| 1 | ``0x07`` | ROUTE_PLAN service |
-| 2 | ``0xFF`` | sub_service |
-| 3 | ``0xFF`` | file_tag (no upload-tag magic — this is not a chunked stream) |
-| 4 | ``0x05`` | operation = FILE_USE |
-| 5–6 | ``0xFF`` | sub_operation, reserved |
-| 7–8 | BE size | length of the protobuf body |
-| 9 | CRC8 | over the protobuf body |
-| 10 | ``0x01`` | END_TYPE_PB (no chunked-stream endType byte for this op) |
-| 11–18 | ``0xFF`` | reserved |
-| 19 | CRC8 | over bytes 0..18 |
+| Field | Value | Notes |
+|-------|-------|-------|
+| ``id`` (1) | ``file_id`` | varint — matches the upload's file_id |
+| ``file_type`` (2) | ``enum_ROUTE_PLAN_FILE_TYPE_CNX`` (1) | |
+| ``name`` (3) | display name | **required** by BSC200 firmware; capture shows ``str(file_id)`` for unnamed routes (e.g. ``"235679"``). Omitting it causes a silent drop on the device side. |
+| ``total_distance`` (4) | metres, ``0`` if unknown | the app sends ``0`` for newly-uploaded routes; the device doesn't validate this. |
 
-Channel split (generation-aware, per ``setRoutePlanFile`` smali):
+Channel mapping (per ``setRoutePlanFile`` smali + ``send$lambda-135``):
 
-| Device generation | Body channel | Header channel |
-|-------------------|--------------|----------------|
-| gen < 3 (legacy) | ``data`` (``…-9e``) | ``control`` (``…-8e``) |
-| gen ≥ 3 (BSC200, BSC300, iGS320/520/630) | ``fourth`` (``…-6e``) | ``control`` (``…-8e``) |
+| Device gen | Write |
+|-----------:|-------|
+| **4** (BSC200, iGS630) | **Single** merged write (head ‖ body) on ``fourth`` (``…-6e``). ``StringUtils.byteMerger(pair.second, pair.first)`` glues them; ``send$lambda-135`` skips the follow-up control write. |
+| 2–3 (legacy iGS520, …) | Two writes: body on the data-bearing UART (``fourth`` for gen 3, ``data`` for gen 2), then the 20-byte head on ``control`` (``…-8e``). |
 
-The device replies with a single ``ConfirmFrame`` on the ROUTE_PLAN
-service. The status byte at offset 7 is the same
-``DeviceReturnStatus`` ordinal used by FILE_SEND — ``0 = Success``,
-anything else is a refusal (``1 = DataError``, ``16 = NavigationRouteDoesNotExist``,
-etc. — see §7 status table).
+The device replies with a 20-byte ``TYPE_CONFIRM`` (0x02) frame on
+the same ROUTE_PLAN service:
+
+```
+02 07 ff ff 05 ff ff <status> ff*11 <crc8>
+                    ^^^^^^^^ DeviceReturnStatus wire byte
+```
+
+Status decoding (from ``DeviceReturnStatus.smali`` — the wire
+values are **not** sequential ordinals; the WiFi block jumps to
+16-23 and the Navigation block to 65-66):
+
+| Wire byte | Name | Meaning for FILE_USE |
+|----------:|------|----------------------|
+| 0 | Success | Route activated; navigation mode on. |
+| 1 | DataError | Malformed protobuf (e.g. missing ``name`` field). |
+| 5 | IsBeingUsed | Another route is active and locked. |
+| 65 | NavigationRouteDeletionFailed | (FILE_DEL-specific; never seen here.) |
+| 66 (0x42) | NavigationRouteDoesNotExist | The ``file_id`` isn't on the device. The app's typical flow fires a speculative FILE_USE first; on 66 it uploads via FILE_OPERATION ADD and retries. |
 
 #### Library binding
 
 `ligpsport.file_transfer.upload_route_plan(..., start_navigation=True)`
-issues FILE_USE automatically after a successful upload on either
-path (FILE_OPERATION ADD for CNX, ROUTE_PLAN FILE_SEND for legacy
-chunked formats). The CLI exposes this as a trailing ``start``
-token:
+(and the underlying ``upload_general_file``) issues FILE_USE
+automatically after a successful upload, using the gen-4 merged-write
+wire format the BSC200 expects. The CLI exposes this as a trailing
+``start`` token:
 
 ```sh
 ligpsport command --name bike upload-route trip.gpx 1 start
@@ -733,12 +762,41 @@ Without ``start`` the route is loaded but the user must pick it
 manually from the on-device route list. A non-zero FILE_USE status
 raises :class:`ligpsport.file_transfer.NavigationStartError`; the
 upload itself is still considered successful (the file remains on
-the device for a later retry or manual activation).
+the device and can be activated later — either by retrying the
+FILE_USE or via the on-device UI).
 
-There is no inverse "stop navigation" command. To switch routes,
-issue another FILE_USE with the new file id; to clear an active
-navigation, the on-device UI is the only path (no ``FILE_UNUSE``
-operation exists in the proto).
+There is no inverse "stop navigation" command in the protocol. The
+``DEV_NAVI_STATUS`` enum has only ``ON`` and ``OFF`` values, and
+``route_plan.proto`` has no ``FILE_UNUSE`` / ``STOP_NAV`` op. The
+app's UX confirms this: navigation is ended by the user on the
+device itself (back-button / "End Navigation" menu). For automated
+test cleanup the simulator's
+:attr:`ligpsport.simulator.SimulatorState.navi_status` field can be
+reset directly — there is no BLE-level analog on the real device.
+
+### 7.3 Checking whether navigation is currently active
+
+The device's ``DEV_STATUS SEND`` payload (service 13) carries
+``navi_status`` (``DEV_NAVI_STATUS`` enum from ``dev_status.proto`` —
+``0 = OFF``, ``1 = ON``) alongside every periodic status update. The
+library surfaces this in two ways:
+
+* :func:`ligpsport.commands._r_status` (CLI: ``status``) decodes the
+  full real-time block, with ``navi_status`` as one field of the
+  :class:`commands.DeviceStatus` dataclass.
+* :func:`ligpsport.commands._r_nav_status` (CLI: ``nav-status``) is
+  the focused variant — it issues the same ``DEV_STATUS GET``
+  request and returns just a :class:`commands.NavStatus` with
+  ``is_navigating: bool``. Use this in automation and e2e tests
+  where the rest of the status payload isn't needed.
+
+Both go through ``client.request`` against the DEV_STATUS service,
+so they work over any transport (BlueZ, bleak, loopback) and
+exercise the same code path that the simulator's
+``_handle_dev_status`` returns. The simulator flips
+``state.navi_status`` to ``1`` on every successful FILE_USE
+(``Simulator._handle_route_use``), making this checkable
+end-to-end without a real device.
 
 ## 8. Destructive operations
 

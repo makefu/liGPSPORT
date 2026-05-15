@@ -358,6 +358,54 @@ async def _r_status(
     )
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class NavStatus:
+    """Decoded ``DEV_STATUS.navi_status`` field.
+
+    The device reports navigation as a single byte (0 = off, 1 = on)
+    in every periodic ``DEV_STATUS SEND`` payload. We surface it as
+    its own command for tests and scripts that only care about the
+    nav state — no need to parse the whole real-time data block.
+
+    Values come straight from ``dev_status.proto``'s
+    ``DEV_NAVI_STATUS`` enum; the BSC200 firmware reports
+    ``DEV_NAVI_STATUS_ON`` (1) immediately after a successful
+    ``ROUTE_PLAN FILE_USE`` (see PROTOCOL.md §7.2 / §7.3).
+    """
+
+    is_navigating: bool
+    raw: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {"is_navigating": self.is_navigating, "raw": self.raw}
+
+    def format(self) -> str:
+        return f"Navigation: {'ON' if self.is_navigating else 'OFF'} (raw={self.raw})"
+
+
+async def _r_nav_status(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    _args: Sequence[str],
+    timeout: float,
+) -> NavStatus:
+    """Read ``DEV_STATUS`` and report only ``navi_status``.
+
+    A focused alternative to the ``status`` command for e2e tests
+    and CI scripts: returns a boolean ``is_navigating`` next to the
+    raw byte. The same DEV_STATUS GET request the full ``status``
+    command uses — the device replies with the same ``dev_status_msg``
+    and we just read ``navi_status``.
+    """
+    request = dev_status_pb2.dev_status_msg()
+    request.op_type = dev_status_pb2.enum_DEV_STATUS_OPERATE_TYPE_GET
+    response = await client.request(request, timeout=timeout)
+    msg = response.message
+    if not isinstance(msg, dev_status_pb2.dev_status_msg):
+        raise CommandError(f"unexpected response message: {type(msg).__name__}")
+    return NavStatus(is_navigating=msg.navi_status == 1, raw=int(msg.navi_status))
+
+
 async def _r_user(
     _spec: CommandSpec,
     client: _client.IgpsportClient,
@@ -972,6 +1020,15 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
         name="status",
         description="Read live ride status (speed, heart rate, cadence, power, GPS).",
         runner=_r_status,
+    ),
+    "nav-status": CommandSpec(
+        name="nav-status",
+        description=(
+            "Read only the navigation on/off byte from DEV_STATUS. Returns "
+            "is_navigating=True after a successful upload-route ... start "
+            "while the device is still on the navigation screen."
+        ),
+        runner=_r_nav_status,
     ),
     "user": CommandSpec(
         name="user",

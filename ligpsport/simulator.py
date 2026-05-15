@@ -175,9 +175,18 @@ async def _handle_dev_ver_info(
 
 
 async def _handle_dev_status(
-    state: SimulatorState, frame: framing.Frame, _msg: Message
+    state: SimulatorState, frame: framing.Frame, msg: Message
 ) -> Message | None:
-    if frame.operation != dev_status_pb2.enum_DEV_STATUS_OPERATE_TYPE_GET:
+    # The framing-level OP_GET (= 2) doesn't match every service's
+    # proto enum — DEV_STATUS has its own ``enum_DEV_STATUS_OPERATE_TYPE_GET = 1``.
+    # Accept either: the proto's op_type field (the authoritative
+    # source the real firmware reads) or the framing operation byte.
+    proto_op = msg.op_type if isinstance(msg, dev_status_pb2.dev_status_msg) else 0
+    if (
+        frame.operation != dev_status_pb2.enum_DEV_STATUS_OPERATE_TYPE_GET
+        and frame.operation != _client.OP_GET
+        and proto_op != dev_status_pb2.enum_DEV_STATUS_OPERATE_TYPE_GET
+    ):
         return None
     reply = dev_status_pb2.dev_status_msg()
     reply.op_type = dev_status_pb2.enum_DEV_STATUS_OPERATE_TYPE_SEND
@@ -347,24 +356,31 @@ class Simulator:
         return ("control", await self._transport.receive())
 
     async def _handle_one(self, channel: Channel, raw: bytes) -> None:
-        # Multi-channel uploads land here as raw chunk bytes on data /
-        # fourth. There are two streams to disambiguate:
+        # Three distinct streams can land on data / fourth channels:
         #
-        # (a) ROUTE_PLAN FILE_SEND chunks — each write is a complete
-        #     route_plan_data_msg protobuf paired with a 20-byte
-        #     trailer on control. Buffer until the trailer arrives.
-        # (b) FILE_OPERATION ADD streams — a single multi-write stream
-        #     on the fourth channel that starts with a 20-byte head
-        #     (byte 1 == 0x15 = FILE_OPERATION service) and has no
-        #     per-chunk trailer. Accumulate until the head's size
-        #     prefix is satisfied, then ACK with a single notification.
-        #
-        # Disambiguate by the first byte: a head is TYPE_PB (0x01); a
-        # route_plan_data_msg protobuf starts with field-1 varint tag
-        # (0x08).
+        # (a) ROUTE_PLAN FILE_SEND chunks (legacy gen-3 split):
+        #     each write is a complete route_plan_data_msg protobuf,
+        #     paired with a 20-byte trailer on control. Starts with
+        #     0x08 (field-1 varint tag), no leading head.
+        # (b) FILE_OPERATION ADD streams: multi-write stream on
+        #     the fourth channel that starts with a 20-byte head
+        #     (byte 1 == 0x15 = FILE_OPERATION) and has no per-chunk
+        #     trailer. Accumulate until the head's size prefix is
+        #     satisfied, then ACK.
+        # (c) ROUTE_PLAN FILE_USE merged write (gen-4 BSC200): a
+        #     single write of (20-byte head with service=0x07 +
+        #     op=0x05) || protobuf body, no follow-up trailer.
+        #     Dispatch directly to the FILE_USE handler.
         if channel in ("data", "fourth"):
             if self._in_progress_general_upload is not None or self._looks_like_file_op_head(raw):
                 await self._absorb_general_upload_chunk(raw)
+                return
+            if self._looks_like_route_plan_file_use_merged(raw):
+                payload_size = (raw[framing.HDR_PAYLOAD_SIZE] << 8) | raw[
+                    framing.HDR_PAYLOAD_SIZE + 1
+                ]
+                body = raw[framing.HEADER_SIZE : framing.HEADER_SIZE + payload_size]
+                await self._handle_route_use(body)
                 return
             self._pending_chunk[channel] = raw
             return
@@ -505,6 +521,26 @@ class Simulator:
             and raw[framing.HDR_FILE_TAG] == 0xAA
         )
 
+    @staticmethod
+    def _looks_like_route_plan_file_use_merged(raw: bytes) -> bool:
+        """Heuristic: does *raw* start with a ROUTE_PLAN FILE_USE head?
+
+        Gen-4 devices (BSC200) receive FILE_USE as a single merged
+        write to the fourth characteristic — 20-byte head followed by
+        the protobuf body, no control trailer. The head's service
+        byte is 0x07 (ROUTE_PLAN) and the operation byte is 0x05
+        (FILE_USE), distinguishing it from FILE_OPERATION uploads
+        and FILE_SEND chunks. Verified against ``docs/PROTOCOL.md``
+        §7.2 and the live snoop capture.
+        """
+        return (
+            len(raw) >= framing.HEADER_SIZE
+            and raw[framing.HDR_TYPE] == framing.TYPE_PB
+            and raw[framing.HDR_SERVICE] == (common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN & 0xFF)
+            and raw[framing.HDR_OPERATION]
+            == (route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE & 0xFF)
+        )
+
     async def _absorb_general_upload_chunk(self, raw: bytes) -> None:
         """Buffer one slice of a FILE_OPERATION ADD upload; finalise on EOF.
 
@@ -559,21 +595,38 @@ class Simulator:
         await self._transport.send(ack)
 
     async def _handle_route_use(self, chunk: bytes) -> None:
-        """Handle a FILE_USE commit. Records the file_id used and acks 0."""
+        """Handle a FILE_USE commit.
+
+        Mirrors the BSC200 firmware's observed behaviour (from
+        ``docs/PROTOCOL.md`` §7.2 + the snoop_start capture):
+
+        * If the requested ``file_id`` is in
+          :attr:`SimulatorState.uploaded_routes`, the simulator
+          activates it — sets :attr:`active_route_id` and flips
+          :attr:`navi_status` to ``DEV_NAVI_STATUS_ON`` (1) — and
+          ACKs with ``status=0`` (Success).
+        * Otherwise the simulator ACKs with ``status=66``
+          (``NavigationRouteDoesNotExist`` — wire byte ``0x42``
+          from ``DeviceReturnStatus.smali``). The real device
+          returns the same code; the app retries after uploading.
+        """
         msg = route_plan_pb2.route_plan_data_msg()
         msg.ParseFromString(chunk)
         info = msg.route_plan_info_msg[0] if msg.route_plan_info_msg else None
         used_id = info.id if info is not None else 0
+        found = False
         for entry in self.state.uploaded_routes:
             if entry.file_id == used_id:
                 self.state.active_route_id = used_id
+                self.state.navi_status = 1  # DEV_NAVI_STATUS_ON
+                found = True
                 break
         ack = framing.build_frame(
             framing.Frame(
                 type=framing.TYPE_CONFIRM,
                 service=common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN,
                 operation=route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE,
-                status=0,
+                status=0 if found else 66,
             )
         )
         await self._transport.send(ack)

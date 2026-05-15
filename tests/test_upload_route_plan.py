@@ -279,3 +279,106 @@ async def test_navigation_start_error_when_file_use_fails() -> None:
     assert err.file_id == 42
     assert err.status == 1
     assert "DataError" in str(err)
+
+
+async def test_upload_with_start_navigation_gen4_e2e() -> None:
+    """End-to-end: CNX upload + FILE_USE on gen-4 path → navigation active.
+
+    Exercises the wire format the BSC200 firmware actually accepts,
+    verified against ``snoop_start.log``:
+
+    1. CNX bytes go via FILE_OPERATION ADD (single multi-write
+       stream on the fourth characteristic, head + size + protobuf
+       + bytes).
+    2. After the upload ACKs, the library issues a ROUTE_PLAN
+       FILE_USE — for ``generation=4`` (BSC200) this is a single
+       merged write of (20-byte head || protobuf body) to the
+       fourth characteristic, **not** the legacy split.
+    3. The simulator activates the route (sets ``active_route_id``
+       and flips ``navi_status`` to ``DEV_NAVI_STATUS_ON``) and ACKs
+       with status=0.
+    4. A follow-up ``nav-status`` query confirms the device-side
+       state by going through the public ``DEV_STATUS GET`` path —
+       the same way an external monitoring caller would check.
+
+    Earlier releases had three independent bugs that made this
+    sequence fail against the real device (and made an end-to-end
+    test impossible against the simulator):
+
+      * FILE_USE was sent as two writes (body on data, header on
+        control) which the gen-4 BSC200 ignored.
+      * The route_plan_info_msg protobuf was missing the ``name``
+        field, which the firmware validates.
+      * The default device generation was 3, taking the wrong
+        wire-format branch in :func:`_send_file_use`.
+
+    This test wires all three together.
+    """
+    cnx_bytes = (_REPO_ROOT / "tests" / "fixtures" / "cnx_cloud_capture.cnx").read_bytes()
+    route = RouteData(name="trip", points=(Point(latitude=48.8, longitude=9.2),))
+    file_id = 1778760617  # matches the captured cloud CNX
+
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState()
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        status = await file_transfer.upload_route_plan(
+            client,
+            route,
+            file_id=file_id,
+            file_extension="cnx",
+            # generation=4 (default) → merged-write FILE_USE on the
+            # fourth channel.
+            device_name="BSC200",
+            timeout=2.0,
+            raw_bytes=cnx_bytes,
+            raw_name="trip",
+            start_navigation=True,
+        )
+        # The library returns the FILE_OPERATION upload status (0).
+        assert status == 0
+        # The simulator received the CNX upload.
+        assert state.uploaded_routes
+        uploaded = state.uploaded_routes[-1]
+        assert uploaded.file_id == file_id
+        assert uploaded.content == cnx_bytes
+        # FILE_USE flipped the simulator's active-route + nav state.
+        assert state.active_route_id == file_id
+        assert state.navi_status == 1  # DEV_NAVI_STATUS_ON
+
+        # The public DEV_STATUS GET path now reports nav as active —
+        # this is what the new `nav-status` CLI command consumes.
+        from ligpsport.commands import COMMANDS
+
+        result = await COMMANDS["nav-status"].run(client, args=())
+        assert result.value.is_navigating is True
+        assert result.value.raw == 1
+
+
+async def test_file_use_not_exist_returns_status_66() -> None:
+    """FILE_USE for a route the device doesn't have returns wire byte 66.
+
+    Mirrors the BSC200's documented "route not on device yet"
+    behaviour from ``snoop_start.log``: the app fires FILE_USE
+    before the upload, gets back status=0x42=66
+    (NavigationRouteDoesNotExist), then uploads and retries.
+
+    The library promotes this into :class:`NavigationStartError`
+    when ``start_navigation=True`` was requested, with the
+    human-readable ``NavigationRouteDoesNotExist`` name.
+    """
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState()  # empty uploaded_routes
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        status = await file_transfer._send_file_use(
+            client,
+            file_id=9999,
+            file_extension="cnx",
+            generation=4,
+            timeout=2.0,
+            name="9999",
+        )
+    assert status == 66
+    assert file_transfer._status_name(66) == "NavigationRouteDoesNotExist"
+    # Navigation must NOT have been activated.
+    assert state.active_route_id is None
+    assert state.navi_status == 0

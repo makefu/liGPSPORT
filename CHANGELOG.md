@@ -6,6 +6,84 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-05-15
+
+The v1.1.0 ``start_navigation`` flag didn't actually start
+navigation on the device — three independent bugs in the wire format
+made the BSC200 firmware silently drop the FILE_USE. This release
+fixes them and adds a focused ``nav-status`` command so end-to-end
+tests can verify the device actually switched into navigation mode.
+
+### Fixed
+- **FILE_USE wire format**: send a single merged write of
+  (20-byte head ‖ protobuf body) to the ``fourth`` characteristic,
+  matching the gen-4 path in ``setRoutePlanFile`` smali +
+  ``send$lambda-135``. The previous two-write split (body on
+  ``fourth``, header on ``control``) was the gen-3 path and the
+  BSC200 firmware silently ignored it. Verified byte-for-byte
+  against frames 35405 / 35545 of a captured "Start navigation"
+  tap in the iGPSPORT Android app.
+- **FILE_USE protobuf**: include the required ``name`` and
+  ``total_distance`` fields in the nested ``route_plan_info_msg``.
+  The BSC200 firmware validates ``name`` (the live capture shows
+  ``str(file_id)`` for unnamed routes) and drops requests that
+  omit it. ``upload_route_plan`` plumbs the truncated upload
+  filename and ``route.distance_m`` through to the FILE_USE.
+- **Default device generation** for ``upload_route_plan`` /
+  ``upload_general_file`` raised from 3 to 4 — the BSC200 reports
+  ``getGeneration() == 4`` and takes the merged-write path. The
+  earlier default of 3 routed FILE_USE through the legacy
+  two-channel split.
+- **DeviceReturnStatus wire-value mapping**: the WiFi block lives at
+  16-23 and the Navigation block at 65-66 (not 7-16 as earlier
+  releases mapped them). Sourced from
+  ``DeviceReturnStatus.smali``'s constructor calls. Affects every
+  ``RouteUploadError`` / ``NavigationStartError`` message — most
+  visibly, a FILE_USE for a not-yet-uploaded route returns
+  wire byte 0x42 (66), which now decodes to
+  ``NavigationRouteDoesNotExist`` rather than the wrong
+  ``unknown(66)``.
+
+### Added
+- ``nav-status`` CLI command + :class:`commands.NavStatus`
+  dataclass: read just the ``navi_status`` byte from
+  ``DEV_STATUS``. Returns ``is_navigating=True`` when the device
+  is on the navigation screen (after a successful
+  ``upload-route ... start`` or any other FILE_USE). Targeted at
+  automation and e2e tests that don't need the full status block.
+- Simulator: ``_looks_like_route_plan_file_use_merged`` +
+  ``_handle_route_use`` updates that recognise the new
+  single-write FILE_USE pattern, flip
+  ``SimulatorState.navi_status`` to ``DEV_NAVI_STATUS_ON`` on a
+  successful activation, and ACK with status=66
+  (``NavigationRouteDoesNotExist``) when the requested file_id
+  hasn't been uploaded yet. Faithfully mirrors the firmware
+  behaviour observed in ``snoop_start.log``.
+- Simulator: ``_handle_dev_status`` accepts both the framing-level
+  ``OP_GET = 2`` and the proto-level
+  ``enum_DEV_STATUS_OPERATE_TYPE_GET = 1`` (and falls back to
+  ``msg.op_type``) so the existing ``status`` runner finally works
+  against the simulator. Tests for the new ``nav-status`` command
+  depend on this.
+- Tests: ``test_upload_with_start_navigation_gen4_e2e`` exercises
+  the full upload → FILE_USE → ``DEV_STATUS GET`` round-trip
+  through the simulator and asserts ``state.navi_status == 1``
+  plus ``nav-status`` reporting ``is_navigating=True``;
+  ``test_file_use_not_exist_returns_status_66`` covers the
+  pre-upload speculative FILE_USE path.
+- ``docs/PROTOCOL.md`` §7.2 rewritten with the gen-4 wire-format
+  table, the full ``route_plan_info_msg`` field list, the
+  corrected status-byte semantics, and a new §7.3 documenting the
+  read-side ``DEV_STATUS.navi_status`` path.
+
+### Notes
+- There is still no BLE-level "stop navigation" operation; the
+  ``DEV_NAVI_STATUS`` enum is read-only and the proto has no
+  ``FILE_UNUSE``. For unattended e2e against the real device,
+  expect to either rely on a long enough navigation timeout or
+  end navigation manually on the bike computer. Simulator tests
+  can reset ``state.navi_status`` directly.
+
 ## [1.1.0] — 2026-05-15
 
 Upload-and-go: the library can now end the route upload by also
