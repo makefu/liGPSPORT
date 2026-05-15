@@ -385,3 +385,108 @@ async def test_file_use_not_exist_returns_status_66() -> None:
     # Navigation must NOT have been activated.
     assert state.active_route_id is None
     assert state.navi_status == 0
+
+
+async def test_del_route_removes_inactive_route() -> None:
+    """``del-route <id>`` removes an inactive route from the device."""
+    from ligpsport.commands import COMMANDS
+    from ligpsport.simulator import UploadedRouteFile
+
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState(
+        active_route_id=42,
+        uploaded_routes=[
+            UploadedRouteFile(
+                file_id=42,
+                file_type=1,
+                name="active",
+                extension="cnx",
+                total_distance=0,
+                content=b"",
+                end_types=[],
+            ),
+            UploadedRouteFile(
+                file_id=43,
+                file_type=1,
+                name="inactive",
+                extension="cnx",
+                total_distance=0,
+                content=b"",
+                end_types=[],
+            ),
+        ],
+    )
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        result = (
+            await COMMANDS["del-route"].run(client, args=("43",), allow_destructive=True)
+        ).value
+    assert result.deleted is True
+    assert result.was_active is False
+    assert result.not_found is False
+    assert result.file_id == 43
+    assert result.name == "inactive"
+    ids = {e.file_id for e in state.uploaded_routes}
+    assert ids == {42}  # 43 gone, 42 (active) untouched
+
+
+async def test_del_route_refuses_active_route_firmware_protection() -> None:
+    """``del-route`` on the active route is rejected by simulator/firmware.
+
+    The BSC200 firmware silently no-ops FILES_DEL on the route it
+    is currently navigating (PROTOCOL.md §7.4). The simulator mirrors
+    that: the active route survives the delete request and the
+    command's result reports ``was_active=True`` with ``deleted=False``.
+    """
+    from ligpsport.commands import COMMANDS
+    from ligpsport.simulator import UploadedRouteFile
+
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState(
+        active_route_id=42,
+        uploaded_routes=[
+            UploadedRouteFile(
+                file_id=42,
+                file_type=1,
+                name="active",
+                extension="cnx",
+                total_distance=0,
+                content=b"",
+                end_types=[],
+            ),
+        ],
+    )
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        result = (
+            await COMMANDS["del-route"].run(client, args=("42",), allow_destructive=True)
+        ).value
+    assert result.deleted is False
+    assert result.was_active is True
+    assert "currently active" in result.format()
+    ids = {e.file_id for e in state.uploaded_routes}
+    assert ids == {42}  # active route still on device
+
+
+async def test_del_route_unknown_id_reports_not_found() -> None:
+    """``del-route`` on an id that isn't on the device reports not_found."""
+    from ligpsport.commands import COMMANDS
+
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState()
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        result = (
+            await COMMANDS["del-route"].run(client, args=("999",), allow_destructive=True)
+        ).value
+    assert result.not_found is True
+    assert result.deleted is False
+    assert "No route" in result.format()
+
+
+async def test_del_route_requires_allow_destructive() -> None:
+    """``del-route`` refuses to run without ``allow_destructive``."""
+    from ligpsport.commands import COMMANDS, DestructiveCommandError
+
+    client_t, peer_t = make_loopback_pair()
+    state = SimulatorState()
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        with pytest.raises(DestructiveCommandError):
+            await COMMANDS["del-route"].run(client, args=("1",))

@@ -6,6 +6,63 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-05-15
+
+Two new commands aimed at managing routes from the CLI:
+``list-routes`` and ``del-route``.
+
+The investigation in ``docs/PROTOCOL.md`` §7.4 confirmed that the
+BSC200 has no BLE primitive to stop navigation: the protocol
+exposes no ``STOP_NAV`` / ``FILE_UNUSE`` opcode, the iGPSPORT
+Android app does not offer such a button, and the firmware
+silently no-ops every ``FILE_DEL`` / ``FILES_DEL`` aimed at the
+route currently in use (status=0 ack, route stays). Inactive
+routes delete normally — the protection is specific to the
+active id. A speculative ``stop-nav`` command was prototyped and
+dropped because it could never actually stop navigation; the
+investigation and the table of probed candidates are preserved
+in PROTOCOL.md §7.4 for posterity.
+
+### Added
+- ``list-routes`` command (:func:`commands._r_list_routes`,
+  :class:`commands.RouteSummary` /
+  :class:`commands.RouteSummaryList`): compact ``id name [*]``
+  listing built on ``ROUTE_PLAN LIST_GET``. The ``*`` marker
+  tags the currently-navigated route.
+- ``del-route <id>`` command (:func:`commands._r_del_route`,
+  :class:`commands.DelRouteResult`): deletes one route plan from
+  the device by id (ids come from ``routes`` / ``list-routes``).
+  The result distinguishes ``deleted``, ``not_found``, and
+  ``was_active`` (the firmware-protected case). Marked
+  destructive — requires ``--allow-destructive-commands``.
+- :func:`file_transfer.delete_route_plan_files`: library helper
+  that emits ``ROUTE_PLAN FILES_DEL`` with the wire format the
+  firmware accepts — single merged write on the gen-4 fourth
+  channel carrying **both** ``line_id`` (``"<id>.cnx"``) and full
+  ``route_plan_info_msg`` records (id, file_type=CNX, name,
+  total_distance). Sending only one of the two field sets is
+  rejected. Available to scripts that need to delete multiple
+  routes in one shot.
+- Simulator: ``_handle_route_files_del`` mirrors the BSC200's
+  active-route protection so ``del-route`` can be tested
+  hermetically against both the success path and the
+  firmware-refusal path.
+- Four regression tests in ``tests/test_upload_route_plan.py``:
+  inactive-route delete works, active-route delete is refused,
+  unknown id reports ``not_found``, and the destructive gate is
+  enforced.
+
+### Documentation
+- ``docs/PROTOCOL.md`` §7.4 — "Deleting routes — and why
+  navigation cannot be stopped over BLE": probe table, wire
+  format, and ``del-route`` binding.
+
+### Notes
+- Live-verified against ``F7:11:62:07:21:F5`` on firmware
+  2024-05-14: ``list-routes`` shows id/name with active marker;
+  ``del-route`` succeeds on inactive routes and reports
+  "currently active" on the navigating one.
+
 ## [1.2.1] — 2026-05-15
 
 The v1.2.0 ``nav-status`` command read ``DEV_STATUS.navi_status``,

@@ -17,7 +17,7 @@
         # standalone, outside that env, sidesteps the issue.
         package = python.pkgs.buildPythonPackage {
           pname = "ligpsport";
-          version = "1.2.1";
+          version = "1.3.0";
           src = ./.;
           pyproject = true;
           build-system = [ python.pkgs.setuptools ];

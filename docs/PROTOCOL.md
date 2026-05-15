@@ -842,6 +842,76 @@ tagged USED if its ``file_id`` matches
 the "upload + start navigation + verify active" loop hermetic
 without a real device.
 
+### 7.4 Deleting routes — and why navigation cannot be stopped over BLE
+
+Inactive routes can be deleted from the device via
+``ROUTE_PLAN FILES_DEL`` (op=6). The currently-navigating route
+is **firmware-protected**: every BLE candidate we tried left
+navigation on. There is no dedicated ``STOP_NAV`` /
+``FILE_UNUSE`` opcode in the protocol, the iGPSPORT Android app
+does not expose a "stop" button, and the only way to leave the
+navigation screen via the app is to power-cycle the BSC200 or
+press the device's own *Stop* button. Live-probed against
+firmware 2024-05-14 on ``F7:11:62:07:21:F5``:
+
+| Candidate                                    | Wire status   | Effect on active route        |
+|----------------------------------------------|---------------|-------------------------------|
+| ``FILE_USE`` with ``file_id=0`` name=``"0"`` | ``0`` (ok)    | Switches to id 0; nav stays on |
+| ``FILE_USE`` with a bogus ``file_id``        | ``66`` (err)  | None — error returned          |
+| ``FILE_DEL`` (op=3) on active route          | ``0`` (ok)    | None — silently no-op'd        |
+| ``FILES_DEL`` (op=6) on active route         | ``0`` (ok)    | None — silently no-op'd        |
+| ``FILES_DEL`` (op=6) on an inactive route    | ``0`` (ok)    | Route gone from ``LIST_GET``   |
+
+The firmware **acks deletions of the currently-navigating route
+with status=0 but does not actually delete it** — a follow-up
+``LIST_GET`` shows the route still present and still tagged
+``enum_USED_STATUS``. Inactive routes are deleted normally, so
+the protection is specific to the active one. This matches the
+Android app's UX: it forces users to delete from the device UI
+exactly when the route is in use.
+
+#### Wire format
+
+The captured ``IGPDeviceManager.deleteRoutePlanFile`` (smali
+line 7419) builds a ``route_plan_data_msg`` with
+``operate_type = FILES_DEL`` and **both** sets of fields
+populated:
+
+* ``line_id`` list — one ``"<id>.<ext>"`` string per target
+* ``route_plan_info_msg`` records — full entries with ``id``,
+  ``file_type``, ``name``, ``total_distance``
+
+Sending only ``line_id`` (or only ``route_plan_info_msg``) is
+silently no-op'd by the BSC200. Gen-4 devices want the head and
+body in a single merged write on the *fourth* characteristic;
+gen ≤ 3 devices take body-on-data + header-on-control.
+
+#### Library binding
+
+* :func:`ligpsport.commands._r_del_route` (CLI:
+  ``del-route <id>``) deletes one route by id. It does a
+  ``LIST_GET`` pre-check to resolve the route's name and
+  active-flag, issues ``FILES_DEL``, then re-lists to confirm
+  the route is gone. The result is honest:
+
+  - ``deleted=True`` — the device dropped the route.
+  - ``not_found=True`` — the id wasn't on the device.
+  - ``was_active=True, deleted=False`` — firmware refused because
+    the route is currently being navigated. Stop navigation on
+    the device, then retry.
+
+  Marked destructive: needs ``--allow-destructive-commands``.
+
+  Live example::
+
+    $ ligpsport command --name bike del-route 24680 \
+        --allow-destructive-commands --backend bluez
+    Deleted route id=24680 name='ligpsport test loop'
+
+* :func:`ligpsport.file_transfer.delete_route_plan_files` is the
+  underlying helper used by ``del-route`` and available to
+  scripts that need to delete multiple routes in one shot.
+
 ## 8. Destructive operations
 
 The following ``(service, operation)`` tuples alter persistent state

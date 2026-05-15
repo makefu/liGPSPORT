@@ -959,3 +959,106 @@ async def upload_general_file(
         if nav_status not in (_STATUS_OK, _STATUS_DONE_EARLY):
             raise NavigationStartError(nav_status, file_id)
     return status
+
+
+# ---- ROUTE_PLAN FILES_DEL --------------------------------------------
+#
+# The iGPSPORT app's `IGPDeviceManager.deleteRoutePlanFile` (smali line
+# 7419) is the reference: it builds a route_plan_data_msg with
+# operate_type = FILES_DEL (op=6, **not** FILE_DEL=3) and BOTH the
+# `line_id` list AND fully populated `route_plan_info_msg` entries
+# (id + file_type + name + total_distance). The BSC200 firmware
+# silently no-ops FILES_DEL requests that are missing the info_msg
+# fields — verified live against firmware 2024-05-14.
+#
+# The active route (status = USED) is protected by the firmware: a
+# FILES_DEL targeting it returns status=0 (Success) but the route
+# stays on the device. Callers that need a hard guarantee must
+# re-issue LIST_GET and check whether the target id is gone. See
+# docs/PROTOCOL.md §7.4.
+
+
+async def delete_route_plan_files(
+    client: IgpsportClient,
+    files: Sequence[tuple[int, str, str]],
+    *,
+    generation: int = 4,
+    timeout: float = 10.0,
+) -> int:
+    """Issue ``ROUTE_PLAN FILES_DEL`` for *files* and return the device status byte.
+
+    *files* is a sequence of ``(file_id, name, extension)`` tuples — the
+    smali pulls these from ``DeleteRouteBean`` and the captured wire
+    shows the BSC200 firmware requires all three fields populated in
+    each ``route_plan_info_msg`` entry.
+
+    *generation*: when ≥ 4 (BSC200, iGS630) the request goes out as a
+    single merged write of (head ‖ body) to the fourth characteristic
+    — same wire pattern as :func:`_send_file_use`. For legacy gen ≤ 3
+    devices it falls back to the body-on-data + header-on-control
+    split.
+
+    Returns the wire status byte. **Caveat**: the active route is
+    protected by BSC200 firmware — the device returns 0 (Success) for
+    any FILES_DEL request that includes the active route, but doesn't
+    actually delete it. Callers that need to confirm a successful
+    delete should re-issue ``ROUTE_PLAN LIST_GET`` and check whether
+    the target ids are gone.
+    """
+    if not files:
+        return _STATUS_OK
+    msg = route_plan_pb2.route_plan_data_msg()
+    msg.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN
+    msg.route_plan_operate_type = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILES_DEL
+    for file_id, name, extension in files:
+        msg.line_id.append(f"{file_id}.{extension}")
+        info = msg.route_plan_info_msg.add()
+        info.id = file_id
+        info.file_type = _ROUTE_PLAN_FILE_TYPE_BY_EXT.get(
+            extension.lower(),
+            route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_INVALID,
+        )
+        info.name = name or str(file_id)
+        info.total_distance = 0
+    body = msg.SerializeToString()
+    header = _build_files_del_header(body)
+    queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN)
+    try:
+        if generation >= 4:
+            await client._transport.send(header + body, channel="fourth")
+        else:
+            data_channel: Channel = "fourth" if generation >= 3 else "data"
+            await client._transport.send(body, channel=data_channel)
+            await client._transport.send(header, channel="control")
+        response = await asyncio.wait_for(queue.get(), timeout=timeout)
+    finally:
+        await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN, queue)
+    status = response.frame.status  # type: ignore[attr-defined]
+    _LOG.debug(
+        "FILES_DEL: %d ids → status=%d (%s)",
+        len(files),
+        status,
+        _status_name(status),
+    )
+    return int(status)
+
+
+def _build_files_del_header(send_data: bytes) -> bytes:
+    """Standard 20-byte PbFrame head with operation=FILES_DEL."""
+    header = bytearray(framing.HEADER_SIZE)
+    header[framing.HDR_TYPE] = framing.TYPE_PB
+    header[framing.HDR_SERVICE] = common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN & 0xFF
+    header[framing.HDR_SUB_SERVICE] = 0xFF
+    header[framing.HDR_FILE_TAG] = 0xFF
+    header[framing.HDR_OPERATION] = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILES_DEL & 0xFF
+    header[framing.HDR_SUB_OPERATION] = 0xFF
+    header[framing.HDR_RESERVED_6] = 0xFF
+    size = len(send_data)
+    header[framing.HDR_PAYLOAD_SIZE] = (size >> 8) & 0xFF
+    header[framing.HDR_PAYLOAD_SIZE + 1] = size & 0xFF
+    header[framing.HDR_PAYLOAD_CRC] = framing.crc8(send_data)
+    header[framing.HDR_END_MARKER] = framing.TYPE_PB
+    for off in range(11, 19):
+        header[off] = 0xFF
+    header[framing.HDR_HEADER_CRC] = framing.crc8(bytes(header[: framing.HDR_HEADER_CRC]))
+    return bytes(header)

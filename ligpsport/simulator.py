@@ -412,21 +412,27 @@ class Simulator:
         #     (byte 1 == 0x15 = FILE_OPERATION) and has no per-chunk
         #     trailer. Accumulate until the head's size prefix is
         #     satisfied, then ACK.
-        # (c) ROUTE_PLAN FILE_USE merged write (gen-4 BSC200): a
-        #     single write of (20-byte head with service=0x07 +
-        #     op=0x05) || protobuf body, no follow-up trailer.
-        #     Dispatch directly to the FILE_USE handler.
+        # (c) ROUTE_PLAN merged write (gen-4 BSC200): a single write
+        #     of (20-byte head with service=0x07) || protobuf body,
+        #     no follow-up trailer. Dispatch to the FILE_USE handler
+        #     for op=5 and to the FILES_DEL handler for op=6 (the
+        #     two ops the library currently emits this way).
         if channel in ("data", "fourth"):
             if self._in_progress_general_upload is not None or self._looks_like_file_op_head(raw):
                 await self._absorb_general_upload_chunk(raw)
                 return
-            if self._looks_like_route_plan_file_use_merged(raw):
+            op = self._route_plan_merged_op(raw)
+            if op is not None:
                 payload_size = (raw[framing.HDR_PAYLOAD_SIZE] << 8) | raw[
                     framing.HDR_PAYLOAD_SIZE + 1
                 ]
                 body = raw[framing.HEADER_SIZE : framing.HEADER_SIZE + payload_size]
-                await self._handle_route_use(body)
-                return
+                if op == route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE:
+                    await self._handle_route_use(body)
+                    return
+                if op == route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILES_DEL:
+                    await self._handle_route_files_del(body)
+                    return
             self._pending_chunk[channel] = raw
             return
         # Control-channel writes are usually a full PbFrame. The
@@ -567,24 +573,31 @@ class Simulator:
         )
 
     @staticmethod
-    def _looks_like_route_plan_file_use_merged(raw: bytes) -> bool:
-        """Heuristic: does *raw* start with a ROUTE_PLAN FILE_USE head?
+    def _route_plan_merged_op(raw: bytes) -> int | None:
+        """If *raw* starts with a ROUTE_PLAN merged-write head, return its op.
 
-        Gen-4 devices (BSC200) receive FILE_USE as a single merged
-        write to the fourth characteristic — 20-byte head followed by
-        the protobuf body, no control trailer. The head's service
-        byte is 0x07 (ROUTE_PLAN) and the operation byte is 0x05
-        (FILE_USE), distinguishing it from FILE_OPERATION uploads
-        and FILE_SEND chunks. Verified against ``docs/PROTOCOL.md``
-        §7.2 and the live snoop capture.
+        Gen-4 devices (BSC200) receive certain ROUTE_PLAN operations
+        as a single merged write to the fourth characteristic — 20-byte
+        head followed by the protobuf body, no control trailer. The
+        library uses this pattern for ``FILE_USE`` (op=5) and
+        ``FILES_DEL`` (op=6); a head with ROUTE_PLAN service + one of
+        those op codes triggers the merged-write dispatch. Other
+        ``FILE_SEND`` chunks (legacy gen-3 split) start with a
+        protobuf field-1 tag (0x08), not 0x01, and so don't collide.
         """
-        return (
-            len(raw) >= framing.HEADER_SIZE
-            and raw[framing.HDR_TYPE] == framing.TYPE_PB
-            and raw[framing.HDR_SERVICE] == (common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN & 0xFF)
-            and raw[framing.HDR_OPERATION]
-            == (route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE & 0xFF)
-        )
+        if (
+            len(raw) < framing.HEADER_SIZE
+            or raw[framing.HDR_TYPE] != framing.TYPE_PB
+            or raw[framing.HDR_SERVICE] != (common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN & 0xFF)
+        ):
+            return None
+        op = raw[framing.HDR_OPERATION]
+        if op in (
+            route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE,
+            route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILES_DEL,
+        ):
+            return int(op)
+        return None
 
     async def _absorb_general_upload_chunk(self, raw: bytes) -> None:
         """Buffer one slice of a FILE_OPERATION ADD upload; finalise on EOF.
@@ -672,6 +685,55 @@ class Simulator:
                 service=common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN,
                 operation=route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_USE,
                 status=0 if found else 66,
+            )
+        )
+        await self._transport.send(ack)
+
+    async def _handle_route_files_del(self, chunk: bytes) -> None:
+        """Handle a FILES_DEL request — mirror BSC200 active-route protection.
+
+        The captured behaviour (PROTOCOL.md §7.4):
+
+        * The device acknowledges every FILES_DEL with status=0 — there
+          is no per-id failure reply.
+        * Inactive routes (``status != USED``) named in ``line_id`` /
+          ``route_plan_info_msg`` are actually removed from the
+          on-device list.
+        * The active route (``status == USED``) is silently kept
+          even when included in the request — the firmware refuses
+          to delete a route that's currently being navigated.
+
+        We mirror both: drop every targeted ``UploadedRouteFile``
+        entry from :attr:`SimulatorState.uploaded_routes` *unless*
+        it's the active one. ACK with status=0 either way.
+        """
+        msg = route_plan_pb2.route_plan_data_msg()
+        msg.ParseFromString(chunk)
+        target_ids: set[int] = set()
+        for info in msg.route_plan_info_msg:
+            target_ids.add(int(info.id))
+        # Some firmwares carry only line_id; pull ids from "<id>.ext"
+        # as a fallback so the handler stays compatible.
+        for line in msg.line_id:
+            stem = line.rsplit(".", 1)[0]
+            try:
+                target_ids.add(int(stem))
+            except ValueError:
+                continue
+
+        kept: list[UploadedRouteFile] = []
+        for entry in self.state.uploaded_routes:
+            if entry.file_id in target_ids and entry.file_id != self.state.active_route_id:
+                continue
+            kept.append(entry)
+        self.state.uploaded_routes = kept
+
+        ack = framing.build_frame(
+            framing.Frame(
+                type=framing.TYPE_CONFIRM,
+                service=common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN,
+                operation=route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILES_DEL,
+                status=0,
             )
         )
         await self._transport.send(ack)

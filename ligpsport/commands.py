@@ -438,6 +438,187 @@ async def _r_nav_status(
     return NavStatus(is_navigating=False, active_route_id=None, active_route_name="")
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class RouteSummary:
+    """One entry in the ``list-routes`` reply — just identification fields."""
+
+    id: int
+    name: str
+    is_active: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        marker = " *" if self.is_active else ""
+        return f"id={self.id} name={self.name!r}{marker}"
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class RouteSummaryList:
+    """Result of the ``list-routes`` command — id/name pairs only.
+
+    The fuller ``routes`` command surfaces file_type, total_distance
+    and status; ``list-routes`` is the focused variant for scripts
+    that just want ``(id, name)`` pairs to drive ``upload-route`` /
+    future ``rename-route`` calls.
+    """
+
+    entries: tuple[RouteSummary, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"entries": [r.to_dict() for r in self.entries]}
+
+    def format(self) -> str:
+        if not self.entries:
+            return "no routes on device"
+        return "\n".join(r.format() for r in self.entries)
+
+
+async def _r_list_routes(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    _args: Sequence[str],
+    timeout: float,
+) -> RouteSummaryList:
+    """Read the route plan list, surface ``(id, name, is_active)`` only.
+
+    Wraps the same ``ROUTE_PLAN LIST_GET`` call as the ``routes``
+    command but trims the result to identification fields. Useful as
+    the lookup table for the other route commands (``upload-route``
+    by id, the future ``rename-route`` / ``delete-route``).
+    """
+    request = route_plan_pb2.route_plan_data_msg()
+    request.route_plan_operate_type = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_LIST_GET
+    request.route_list_get_msg.file_index_start = 0
+    request.route_list_get_msg.file_index_end = 100
+    response = await client.request(request, timeout=timeout)
+    msg = response.message
+    if not isinstance(msg, route_plan_pb2.route_plan_data_msg):
+        raise CommandError(f"unexpected response message: {type(msg).__name__}")
+    used = route_plan_pb2.enum_USED_STATUS
+    entries = tuple(
+        RouteSummary(
+            id=int(r.id),
+            name=str(r.name),
+            is_active=r.status == used,
+        )
+        for r in msg.route_plan_info_msg
+    )
+    return RouteSummaryList(entries=entries)
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class DelRouteResult:
+    """Outcome of the ``del-route`` command.
+
+    ``deleted`` is True iff a follow-up ``LIST_GET`` confirms the
+    target id is gone. The BSC200 firmware protects the active route:
+    a ``FILES_DEL`` targeting it acks with status=0 but the route
+    stays — see PROTOCOL.md §7.4. ``not_found`` distinguishes
+    "device never had this id" from "firmware refused to drop it".
+    """
+
+    file_id: int
+    name: str
+    deleted: bool
+    was_active: bool
+    not_found: bool
+    device_status: int
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        if self.not_found:
+            return f"No route with id={self.file_id} on device"
+        if self.deleted:
+            return f"Deleted route id={self.file_id} name={self.name!r}"
+        if self.was_active:
+            return (
+                f"Refused: route id={self.file_id} name={self.name!r} is "
+                "currently active — the BSC200 firmware protects the "
+                "navigating route from deletion. End navigation on the "
+                "device first, then retry."
+            )
+        return (
+            f"Delete failed: route id={self.file_id} name={self.name!r} "
+            f"still present (device status={self.device_status})"
+        )
+
+
+async def _r_del_route(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    args: Sequence[str],
+    timeout: float,
+) -> DelRouteResult:
+    """Delete one route plan by id.
+
+    Usage: ``del-route <id>`` — the id comes from ``routes`` /
+    ``list-routes``. Wraps :func:`file_transfer.delete_route_plan_files`
+    with a pre/post ``LIST_GET`` so the result can report honestly
+    whether the device actually let go of the file.
+    """
+    if len(args) != 1:
+        raise CommandError("del-route takes exactly one argument: <file_id>")
+    try:
+        file_id = int(args[0])
+    except ValueError as exc:
+        raise CommandError(f"del-route: file_id must be an integer, got {args[0]!r}") from exc
+
+    list_req = route_plan_pb2.route_plan_data_msg()
+    list_req.route_plan_operate_type = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_LIST_GET
+    list_req.route_list_get_msg.file_index_start = 0
+    list_req.route_list_get_msg.file_index_end = 100
+    pre = await client.request(list_req, timeout=timeout)
+    if not isinstance(pre.message, route_plan_pb2.route_plan_data_msg):
+        raise CommandError(f"unexpected response message: {type(pre.message).__name__}")
+
+    used = route_plan_pb2.enum_USED_STATUS
+    name = ""
+    was_active = False
+    found = False
+    for entry in pre.message.route_plan_info_msg:
+        if int(entry.id) == file_id:
+            found = True
+            name = str(entry.name)
+            was_active = entry.status == used
+            break
+    if not found:
+        return DelRouteResult(
+            file_id=file_id,
+            name="",
+            deleted=False,
+            was_active=False,
+            not_found=True,
+            device_status=0,
+        )
+
+    device_status = await file_transfer.delete_route_plan_files(
+        client,
+        [(file_id, name, "cnx")],
+        timeout=timeout,
+    )
+
+    post = await client.request(list_req, timeout=timeout)
+    still_present = False
+    if isinstance(post.message, route_plan_pb2.route_plan_data_msg):
+        for entry in post.message.route_plan_info_msg:
+            if int(entry.id) == file_id:
+                still_present = True
+                break
+
+    return DelRouteResult(
+        file_id=file_id,
+        name=name,
+        deleted=not still_present,
+        was_active=was_active,
+        not_found=False,
+        device_status=device_status,
+    )
+
+
 async def _r_user(
     _spec: CommandSpec,
     client: _client.IgpsportClient,
@@ -1063,11 +1244,33 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
     "nav-status": CommandSpec(
         name="nav-status",
         description=(
-            "Read only the navigation on/off byte from DEV_STATUS. Returns "
-            "is_navigating=True after a successful upload-route ... start "
-            "while the device is still on the navigation screen."
+            "Check whether the device is navigating a route. Returns "
+            "is_navigating=True plus the active route's id/name. "
+            "Reads ROUTE_PLAN LIST_GET and looks for status=USED — "
+            "DEV_STATUS.navi_status is unpopulated on the BSC200."
         ),
         runner=_r_nav_status,
+    ),
+    "list-routes": CommandSpec(
+        name="list-routes",
+        description=(
+            "Compact route listing — returns (id, name, is_active) "
+            "for every route on the device. The fuller `routes` "
+            "command surfaces file_type / total_distance / status."
+        ),
+        runner=_r_list_routes,
+    ),
+    "del-route": CommandSpec(
+        name="del-route",
+        description=(
+            "Delete one route plan from the device by id (`del-route "
+            "<id>`; ids come from `routes` / `list-routes`). The active "
+            "route is protected by firmware and cannot be deleted "
+            "while in use — see PROTOCOL.md §7.4. Destructive."
+        ),
+        runner=_r_del_route,
+        destructive=True,
+        danger="Permanently deletes a route plan from the device.",
     ),
     "user": CommandSpec(
         name="user",
