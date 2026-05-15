@@ -60,6 +60,10 @@ class BleakTransport(Transport):
     # in this neighbourhood.
     _ATT_HEADER_SIZE = 3
     _DEFAULT_MTU = 23  # BLE LL default; bleak negotiates higher on connect.
+    # LE Data Length Extension default; the value the BSC200 negotiates
+    # with the iGPSPORT Android app (PROTOCOL.md §1). Used to override
+    # bleak's _mtu_size when _acquire_mtu fails to update it.
+    _FALLBACK_MTU = 247
 
     def __init__(self, address: str) -> None:
         self._address = address
@@ -82,11 +86,25 @@ class BleakTransport(Transport):
 
         client = BleakClient(self._address)
         await client.connect()
-        # BlueZ doesn't negotiate ATT MTU on its own; ask for the
-        # largest the stack supports so the framing layer's writes go
-        # in one chunk where possible.
-        with contextlib.suppress(Exception):
+        # Surface _acquire_mtu failures at WARNING — silently suppressing
+        # them left bleak's _mtu_size unset, so every write logged a
+        # "Using default MTU value" UserWarning.
+        try:
             await client._acquire_mtu()  # type: ignore[attr-defined]
+            _LOG.info("acquired MTU=%d on %s", self._mtu(), self._address)
+        except Exception as exc:
+            _LOG.warning(
+                "bleak _acquire_mtu() failed (%s: %s); using fallback MTU",
+                type(exc).__name__,
+                exc,
+            )
+        # If bleak still doesn't know the real MTU, set _mtu_size by
+        # hand. Silences bleak's per-write warning; the kernel/controller
+        # fragments oversize writes, so a slight over-estimate is safe.
+        # Use BluezTransport (--backend bluez) for an exact MTU.
+        if self._mtu() <= self._DEFAULT_MTU:
+            client._mtu_size = self._FALLBACK_MTU  # type: ignore[attr-defined]
+            _LOG.info("forcing _mtu_size=%d as fallback", self._FALLBACK_MTU)
         # Subscribe to TX on every channel. The BSC200 receives on the
         # Control RX (8e) but emits responses on the Data TX (9e), and
         # may use 6e/7e for parallel file/firmware streams. Subscribing
