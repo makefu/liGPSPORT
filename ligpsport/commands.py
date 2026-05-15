@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Final
 
 from . import client as _client
-from . import file_transfer
+from . import file_transfer, fit_activity
 from .proto import (
     dev_status_pb2,
     dev_ver_info_pb2,
@@ -901,18 +901,58 @@ async def _r_routes(
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class DownloadedFile:
-    """The contents of a file pulled off the device."""
+    """The contents of a file pulled off the device.
+
+    ``file_format`` is "fit" for raw FIT bytes (the historical default
+    that keeps old callers working) or "gpx" when the FIT payload was
+    converted to GPX before writing.
+    """
 
     path: str
     size_bytes: int
     fit_magic: bool  # True iff the first 12 bytes match the FIT magic header.
+    file_format: str = "fit"
 
     def to_dict(self) -> dict[str, object]:
         return dataclasses.asdict(self)
 
     def format(self) -> str:
-        magic = "FIT header verified" if self.fit_magic else "(not a recognised FIT file)"
-        return f"wrote {self.size_bytes} bytes -> {self.path}  {magic}"
+        if self.file_format == "gpx":
+            tail = "GPX rendered from FIT"
+        else:
+            tail = "FIT header verified" if self.fit_magic else "(not a recognised FIT file)"
+        return f"wrote {self.size_bytes} bytes -> {self.path}  {tail}"
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class DownloadedActivityList:
+    """Result of the ``download-all-activities`` command.
+
+    *entries* is the per-file outcome for everything actually written.
+    *skipped* is the set of paths that already existed before the run
+    and were left alone — the command is idempotent so repeated
+    invocations against the same output directory only fetch what's
+    missing.
+    """
+
+    entries: tuple[DownloadedFile, ...]
+    skipped: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "entries": [e.to_dict() for e in self.entries],
+            "skipped": list(self.skipped),
+        }
+
+    def format(self) -> str:
+        lines: list[str] = []
+        for entry in self.entries:
+            lines.append(entry.format())
+        for path in self.skipped:
+            lines.append(f"skipped (already present): {path}")
+        if not lines:
+            return "no recorded activities on device"
+        return "\n".join(lines)
 
 
 async def _r_set_rtc(
@@ -1317,39 +1357,158 @@ async def _r_get_ride(
     """Download a recorded activity by timestamp.
 
     Same as the new ``download-activity`` command; kept under the
-    older ``get-ride`` name for backwards compatibility. The
-    optional third positional argument used to be ``expected_size``
-    (kept tolerated for old scripts but no longer needed — the
-    BSC200's embedded ``file_download`` protobuf carries the
-    authoritative file size).
+    older ``get-ride`` name for backwards compatibility. Accepts an
+    optional ``type=fit|gpx`` / ``--type fit|gpx`` token (default
+    ``fit``); when ``gpx``, the FIT bytes are parsed and re-rendered
+    to GPX 1.1 via :func:`fit_activity.to_gpx_bytes` before writing.
+    An out-path that names an existing directory (or ends in ``/``)
+    is filled in with :func:`fit_activity.activity_filename_from_meta`.
+    The third positional argument used to be ``expected_size`` (kept
+    tolerated for old scripts but no longer needed — the BSC200's
+    embedded ``file_download`` protobuf carries the authoritative
+    file size).
     """
-    if len(args) < 2:
-        raise CommandError("get-ride takes <timestamp> <out-path>")
+    import pathlib
+
+    positional: list[str] = []
+    file_type = "fit"
+    skip_next = False
+    for i, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg.startswith("type="):
+            file_type = arg.split("=", 1)[1].lower()
+            continue
+        if arg == "--type":
+            if i + 1 >= len(args):
+                raise CommandError("--type requires a value (fit or gpx)")
+            file_type = args[i + 1].lower()
+            skip_next = True
+            continue
+        positional.append(arg)
+    if file_type not in {"fit", "gpx"}:
+        raise CommandError(f"type must be fit or gpx, got {file_type!r}")
+    if len(positional) < 2:
+        raise CommandError(
+            "download-activity / get-ride takes <timestamp> <out-path> [type=fit|gpx]"
+        )
     try:
-        timestamp = int(args[0])
+        timestamp = int(positional[0])
     except ValueError as exc:
-        raise CommandError(f"invalid timestamp: {args[0]!r}") from exc
-    out_path = args[1]
-    if len(args) >= 3:
-        # Tolerate the legacy expected_size positional argument; the
-        # transmit-complete framing path derives the authoritative
-        # size from the device's reply and no longer needs a hint.
+        raise CommandError(f"invalid timestamp: {positional[0]!r}") from exc
+    out_path = positional[1]
+    if len(positional) >= 3:
         try:
-            int(args[2])
+            int(positional[2])
         except ValueError as exc:
-            raise CommandError(f"invalid expected_size: {args[2]!r}") from exc
+            raise CommandError(f"invalid expected_size: {positional[2]!r}") from exc
+
     activity = await file_transfer.download_activity(
         client,
         timestamp=timestamp,
         timeout=max(60.0, timeout * 6),
     )
-    data = activity.content
-    with open(out_path, "wb") as fh:
-        fh.write(data)
-    # FIT files start with the local header pattern: byte 0 = header size
-    # (usually 12 or 14), bytes 8..11 = b".FIT".
-    fit_magic = len(data) >= 12 and data[8:12] == b".FIT"
-    return DownloadedFile(path=out_path, size_bytes=len(data), fit_magic=fit_magic)
+    fit_data = activity.content
+    fit_magic = len(fit_data) >= 12 and fit_data[8:12] == b".FIT"
+
+    out = pathlib.Path(out_path)
+    needs_derivation = out_path.endswith("/") or out.is_dir()
+    if needs_derivation or file_type == "gpx":
+        meta, records = fit_activity.read_activity_fit(fit_data)
+        if needs_derivation:
+            out = out / fit_activity.activity_filename_from_meta(meta, file_type)
+        payload = fit_activity.to_gpx_bytes(meta, records) if file_type == "gpx" else fit_data
+    else:
+        payload = fit_data
+
+    out.write_bytes(payload)
+    return DownloadedFile(
+        path=str(out),
+        size_bytes=len(payload),
+        fit_magic=fit_magic,
+        file_format=file_type,
+    )
+
+
+async def _r_download_all_activities(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    args: Sequence[str],
+    timeout: float,
+) -> DownloadedActivityList:
+    """Bulk-download every activity on the device to a directory.
+
+    Lists activities, downloads each one, writes it to
+    ``<out-dir>/<derived-name>``. Filenames come from
+    :func:`fit_activity.activity_filename_from_meta` so they look the
+    same as the iGPSPORT app's own exports (compact-ISO timestamp +
+    device model + extension). Existing files are not overwritten —
+    they end up in the result's ``skipped`` tuple instead — which
+    makes the command safe to re-run after a partial fetch.
+    Accepts an inline ``type=fit|gpx`` token (default ``fit``).
+    """
+    import pathlib
+
+    positional: list[str] = []
+    file_type = "fit"
+    skip_next = False
+    for i, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg.startswith("type="):
+            file_type = arg.split("=", 1)[1].lower()
+            continue
+        if arg == "--type":
+            if i + 1 >= len(args):
+                raise CommandError("--type requires a value (fit or gpx)")
+            file_type = args[i + 1].lower()
+            skip_next = True
+            continue
+        positional.append(arg)
+    if file_type not in {"fit", "gpx"}:
+        raise CommandError(f"type must be fit or gpx, got {file_type!r}")
+    if len(positional) != 1:
+        raise CommandError("download-all-activities takes <out-dir> [type=fit|gpx]")
+    out_dir = pathlib.Path(positional[0])
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    entries_listed = await file_transfer.list_activities(client, timeout=timeout)
+    downloaded: list[DownloadedFile] = []
+    skipped: list[str] = []
+    for listing in entries_listed:
+        activity = await file_transfer.download_activity(
+            client,
+            timestamp=listing.timestamp,
+            timeout=max(60.0, timeout * 6),
+        )
+        fit_data = activity.content
+        fit_magic = len(fit_data) >= 12 and fit_data[8:12] == b".FIT"
+        meta, records = fit_activity.read_activity_fit(fit_data)
+        # Use the **listing** timestamp rather than meta.time_created
+        # so each activity gets a unique on-disk name — protects against
+        # firmware quirks (or simulator bulk-fakes) that share a FIT
+        # creation time across files in the same flash slot.
+        target = out_dir / fit_activity.activity_filename(
+            timestamp=listing.timestamp,
+            device_model=meta.device_model,
+            extension=file_type,
+        )
+        if target.exists():
+            skipped.append(str(target))
+            continue
+        payload = fit_activity.to_gpx_bytes(meta, records) if file_type == "gpx" else fit_data
+        target.write_bytes(payload)
+        downloaded.append(
+            DownloadedFile(
+                path=str(target),
+                size_bytes=len(payload),
+                fit_magic=fit_magic,
+                file_format=file_type,
+            )
+        )
+    return DownloadedActivityList(entries=tuple(downloaded), skipped=tuple(skipped))
 
 
 async def _r_route_books(
@@ -1480,11 +1639,25 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
         name="download-activity",
         description=(
             "Download a recorded activity file by timestamp. Writes "
-            "the FIT bytes to <out-path>. Syntax: download-activity "
-            "<timestamp> <out-path>. Timestamps come from "
-            "list-activities / rides."
+            "FIT bytes to <out-path>, or GPX with `type=gpx`. When "
+            "<out-path> names an existing directory (or ends in `/`) "
+            "the filename is derived from the FIT header. Syntax: "
+            "download-activity <timestamp> <out-path> [type=fit|gpx]. "
+            "Timestamps come from list-activities / rides."
         ),
         runner=_r_get_ride,
+    ),
+    "download-all-activities": CommandSpec(
+        name="download-all-activities",
+        description=(
+            "List every recorded activity and download each one into "
+            "<out-dir>, deriving the filename from the FIT header "
+            "(<compact-iso>_<device>.<ext>). Existing files are kept "
+            "and reported as skipped, so re-running only fetches the "
+            "ones that aren't there yet. Syntax: download-all-"
+            "activities <out-dir> [type=fit|gpx]."
+        ),
+        runner=_r_download_all_activities,
     ),
     "upload-route": CommandSpec(
         name="upload-route",

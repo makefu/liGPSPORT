@@ -12,14 +12,18 @@ download stream — the device's bogus ``payload_size``, the embedded
 
 from __future__ import annotations
 
+import pathlib
+import xml.etree.ElementTree as ET
+
 import pytest
 
-from ligpsport import file_transfer
+from ligpsport import file_transfer, fit_activity
 from ligpsport.client import IgpsportClient
 from ligpsport.commands import (
     ActivityFile,
     ActivityList,
     DelActivityResult,
+    DownloadedActivityList,
     DownloadedFile,
     SimActivityResult,
     run_named,
@@ -30,6 +34,16 @@ from ligpsport.simulator import (
     SimulatorState,
 )
 from ligpsport.transport import make_loopback_pair
+
+_REAL_FIT_PATH = pathlib.Path(__file__).parent / "fixtures" / "activity_bsc200.fit"
+_REAL_FIT_BYTES = _REAL_FIT_PATH.read_bytes()
+# Derived once so tests stay self-contained even if the fixture changes:
+# the real BSC200 capture parses to time_created = 2026-05-15 14:06:50 UTC
+# and device_model = BSC200, giving "20260515T140650Z_BSC200.<ext>".
+_REAL_META, _REAL_RECORDS = fit_activity.read_activity_fit(_REAL_FIT_BYTES)
+_REAL_FIT_NAME = fit_activity.activity_filename_from_meta(_REAL_META, "fit")
+_REAL_GPX_NAME = fit_activity.activity_filename_from_meta(_REAL_META, "gpx")
+_REAL_TIMESTAMP = int((_REAL_META.time_created - fit_activity.GARMIN_EPOCH_UTC).total_seconds())
 
 
 def _make_fit_bytes(size: int) -> bytes:
@@ -58,6 +72,56 @@ def state_with_one_activity() -> SimulatorState:
                 device_id="BSC200-test",
                 content=_make_fit_bytes(512),
             )
+        ]
+    )
+
+
+@pytest.fixture
+def state_with_real_activity() -> SimulatorState:
+    """One activity whose payload is the captured BSC200 FIT fixture.
+
+    Tests that exercise the GPX conversion or filename derivation need
+    the real FIT records — synthetic bytes only carry the magic.
+    """
+    return SimulatorState(
+        ride_files=[
+            SimulatedRideFile(
+                timestamp=_REAL_TIMESTAMP,
+                file_size=len(_REAL_FIT_BYTES),
+                user_id="user-42",
+                device_id="BSC200-test",
+                content=_REAL_FIT_BYTES,
+            )
+        ]
+    )
+
+
+@pytest.fixture
+def state_with_three_real_activities() -> SimulatorState:
+    """Three activities, all carrying the real FIT payload at different timestamps."""
+    return SimulatorState(
+        ride_files=[
+            SimulatedRideFile(
+                timestamp=_REAL_TIMESTAMP - 200,
+                file_size=len(_REAL_FIT_BYTES),
+                user_id="user-42",
+                device_id="BSC200-test",
+                content=_REAL_FIT_BYTES,
+            ),
+            SimulatedRideFile(
+                timestamp=_REAL_TIMESTAMP - 100,
+                file_size=len(_REAL_FIT_BYTES),
+                user_id="user-42",
+                device_id="BSC200-test",
+                content=_REAL_FIT_BYTES,
+            ),
+            SimulatedRideFile(
+                timestamp=_REAL_TIMESTAMP,
+                file_size=len(_REAL_FIT_BYTES),
+                user_id="user-42",
+                device_id="BSC200-test",
+                content=_REAL_FIT_BYTES,
+            ),
         ]
     )
 
@@ -352,3 +416,171 @@ async def test_sim_activity_destructive_marker() -> None:
     assert spec.destructive is True
     assert spec.danger is not None
     assert (11, 7) in DESTRUCTIVE_PREFIXES
+
+
+async def test_download_activity_type_gpx(
+    state_with_real_activity: SimulatorState,
+    tmp_path,
+) -> None:
+    """``download-activity ... type=gpx`` converts FIT to GPX before writing.
+
+    The real captured FIT carries 421 records with GPS — the rendered
+    GPX must parse and contain at least one ``<trkpt>``.
+    """
+    out = tmp_path / "ride.gpx"
+    client_t, peer_t = make_loopback_pair()
+    async with Simulator(peer_t, state_with_real_activity), IgpsportClient(client_t) as client:
+        result = await run_named(
+            client,
+            "download-activity",
+            args=(str(_REAL_TIMESTAMP), str(out), "type=gpx"),
+            timeout=10.0,
+        )
+
+    assert result.name == "download-activity"
+    value = result.value
+    assert isinstance(value, DownloadedFile)
+    assert value.file_format == "gpx"
+    assert out.exists()
+    tree = ET.fromstring(out.read_bytes())
+    gpx_ns = "{http://www.topografix.com/GPX/1/1}"
+    trkpts = tree.findall(f".//{gpx_ns}trkpt")
+    assert len(trkpts) >= 1
+
+
+async def test_download_activity_filename_derivation(
+    state_with_real_activity: SimulatorState,
+    tmp_path,
+) -> None:
+    """Directory out-path triggers ``activity_filename_from_meta`` for both formats."""
+    client_t, peer_t = make_loopback_pair()
+    async with Simulator(peer_t, state_with_real_activity), IgpsportClient(client_t) as client:
+        fit_result = await run_named(
+            client,
+            "download-activity",
+            args=(str(_REAL_TIMESTAMP), str(tmp_path), "type=fit"),
+            timeout=10.0,
+        )
+        gpx_result = await run_named(
+            client,
+            "download-activity",
+            args=(str(_REAL_TIMESTAMP), str(tmp_path), "type=gpx"),
+            timeout=10.0,
+        )
+
+    assert isinstance(fit_result.value, DownloadedFile)
+    assert fit_result.value.path == str(tmp_path / _REAL_FIT_NAME)
+    assert (tmp_path / _REAL_FIT_NAME).exists()
+    assert fit_result.value.file_format == "fit"
+
+    assert isinstance(gpx_result.value, DownloadedFile)
+    assert gpx_result.value.path == str(tmp_path / _REAL_GPX_NAME)
+    assert (tmp_path / _REAL_GPX_NAME).exists()
+    assert _REAL_GPX_NAME.endswith(".gpx")
+
+
+async def test_download_all_activities_writes_all(
+    state_with_three_real_activities: SimulatorState,
+    tmp_path,
+) -> None:
+    """Bulk download produces one derived-name file per listed activity."""
+    client_t, peer_t = make_loopback_pair()
+    async with (
+        Simulator(peer_t, state_with_three_real_activities),
+        IgpsportClient(client_t) as client,
+    ):
+        result = await run_named(
+            client,
+            "download-all-activities",
+            args=(str(tmp_path),),
+            timeout=10.0,
+        )
+
+    assert result.name == "download-all-activities"
+    value = result.value
+    assert isinstance(value, DownloadedActivityList)
+    assert len(value.entries) == 3
+    assert value.skipped == ()
+    for entry in value.entries:
+        assert entry.file_format == "fit"
+        path = pathlib.Path(entry.path)
+        assert path.exists()
+        assert path.parent == tmp_path
+        # Every written file is a real FIT — bytes 8..11 = ".FIT".
+        assert path.read_bytes()[8:12] == b".FIT"
+
+
+async def test_download_all_activities_gpx_type(
+    state_with_real_activity: SimulatorState,
+    tmp_path,
+) -> None:
+    """``type=gpx`` on the bulk command emits GPX files."""
+    client_t, peer_t = make_loopback_pair()
+    async with Simulator(peer_t, state_with_real_activity), IgpsportClient(client_t) as client:
+        result = await run_named(
+            client,
+            "download-all-activities",
+            args=(str(tmp_path), "type=gpx"),
+            timeout=10.0,
+        )
+
+    assert isinstance(result.value, DownloadedActivityList)
+    assert len(result.value.entries) == 1
+    entry = result.value.entries[0]
+    assert entry.file_format == "gpx"
+    assert entry.path.endswith(".gpx")
+    # Round-trip: the written GPX has at least one trkpt.
+    tree = ET.fromstring(pathlib.Path(entry.path).read_bytes())
+    gpx_ns = "{http://www.topografix.com/GPX/1/1}"
+    assert tree.findall(f".//{gpx_ns}trkpt")
+
+
+async def test_download_all_activities_skips_existing(
+    state_with_real_activity: SimulatorState,
+    tmp_path,
+) -> None:
+    """Pre-existing target file ends up in *skipped* and is not overwritten."""
+    target = tmp_path / _REAL_FIT_NAME
+    sentinel = b"PRE-EXISTING\n"
+    target.write_bytes(sentinel)
+
+    client_t, peer_t = make_loopback_pair()
+    async with Simulator(peer_t, state_with_real_activity), IgpsportClient(client_t) as client:
+        result = await run_named(
+            client,
+            "download-all-activities",
+            args=(str(tmp_path),),
+            timeout=10.0,
+        )
+
+    assert isinstance(result.value, DownloadedActivityList)
+    assert result.value.entries == ()
+    assert result.value.skipped == (str(target),)
+    # Sentinel content untouched — the existing file was not overwritten.
+    assert target.read_bytes() == sentinel
+
+
+async def test_download_activity_legacy_default_is_fit(
+    state_with_one_activity: SimulatorState,
+    tmp_path,
+) -> None:
+    """No ``type`` token → raw FIT bytes written verbatim, file_format='fit'.
+
+    Back-compat guarantee for scripts that already use the
+    ``download-activity <ts> <path>`` two-positional form.
+    """
+    out = tmp_path / "ride.fit"
+    client_t, peer_t = make_loopback_pair()
+    async with Simulator(peer_t, state_with_one_activity), IgpsportClient(client_t) as client:
+        result = await run_named(
+            client,
+            "download-activity",
+            args=("1147795610", str(out)),
+            timeout=10.0,
+        )
+
+    value = result.value
+    assert isinstance(value, DownloadedFile)
+    assert value.file_format == "fit"
+    assert value.fit_magic is True
+    assert out.read_bytes()[8:12] == b".FIT"
