@@ -343,15 +343,18 @@ async def test_upload_with_start_navigation_gen4_e2e() -> None:
         assert uploaded.content == cnx_bytes
         # FILE_USE flipped the simulator's active-route + nav state.
         assert state.active_route_id == file_id
-        assert state.navi_status == 1  # DEV_NAVI_STATUS_ON
 
-        # The public DEV_STATUS GET path now reports nav as active —
-        # this is what the new `nav-status` CLI command consumes.
+        # The public ROUTE_PLAN LIST_GET path (what `nav-status`
+        # uses) reports the active route by status=USED — verified
+        # against the live device, where the BSC200 firmware
+        # populates ``status`` per entry instead of using
+        # ``DEV_STATUS.navi_status`` (which it leaves at 0).
         from ligpsport.commands import COMMANDS
 
         result = await COMMANDS["nav-status"].run(client, args=())
-        assert result.value.is_navigating is True
-        assert result.value.raw == 1
+        nav = result.value
+        assert nav.is_navigating is True
+        assert nav.active_route_id == file_id
 
 
 async def test_file_use_not_exist_returns_status_66() -> None:

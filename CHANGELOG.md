@@ -6,6 +6,57 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-05-15
+
+The v1.2.0 ``nav-status`` command read ``DEV_STATUS.navi_status``,
+which is documented in ``dev_status.proto`` but **never populated by
+the BSC200 firmware** — the field stays 0 even while the device is
+actively navigating. Live-verified against firmware 2024-05-14:
+``Navigation: OFF (raw=0)`` while ``Hopfenhhe`` was on the
+navigation screen.
+
+The actual signal lives in ``ROUTE_PLAN LIST_GET``: each
+``route_plan_info_msg`` in the reply carries a
+``ROUTE_PLAN_FILE_STATUS`` byte and the route currently being
+navigated is tagged ``enum_USED_STATUS = 1``. The iGPSPORT Android
+app uses exactly this mechanism — see
+``RoutePlanViewModel.requestUsingRouteID`` in the smali. This
+release switches ``nav-status`` (and the related ``routes`` command)
+to the same path.
+
+### Fixed
+- ``nav-status``: now reads ``ROUTE_PLAN LIST_GET`` and looks for
+  ``status == enum_USED_STATUS`` instead of ``DEV_STATUS.navi_status``.
+  Live-verified: ``Navigation: ON (route_id=… name=…)`` while
+  navigating, ``Navigation: OFF`` otherwise.
+- ``routes``: the LIST_GET request now includes the
+  ``route_list_get_msg.file_index_start`` /
+  ``file_index_end`` range. Without it, the BSC200 silently returns
+  an empty list — which is why the v1.2.0 ``routes`` command
+  reported zero routes even when the device had several.
+- :class:`commands.NavStatus` extended with ``active_route_id`` and
+  ``active_route_name`` so callers can identify *which* route is
+  active, not just whether navigation is on.
+
+### Changed
+- :class:`commands.NavStatus` field rename: ``raw`` removed
+  (it was always 0 on real hardware), replaced with
+  ``active_route_id: int | None`` and ``active_route_name: str``.
+  Pre-1.2.1 callers that read ``.raw`` will need to update.
+
+### Added
+- Simulator: ``_handle_route_plan`` returns
+  ``SimulatorState.uploaded_routes`` as a ``route_plan_data_msg``
+  with each entry tagged USED / UNUSED per ``active_route_id``.
+  This makes the upload + start-navigation + verify-active loop
+  testable hermetically without a real device.
+
+### Notes
+- Live-verified end-to-end against ``F7:11:62:07:21:F5``:
+  ``upload-route tmp/test_route.geojson 12345678 start`` →
+  ``nav-status`` reports
+  ``Navigation: ON (route_id=12345678 name='ligpsport test loop')``.
+
 ## [1.2.0] — 2026-05-15
 
 The v1.1.0 ``start_navigation`` flag didn't actually start

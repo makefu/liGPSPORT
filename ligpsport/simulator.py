@@ -246,6 +246,50 @@ async def _handle_cycling_data(
     return reply
 
 
+async def _handle_route_plan(
+    state: SimulatorState, frame: framing.Frame, msg: Message
+) -> Message | None:
+    """Handle ROUTE_PLAN LIST_GET → return the simulator's uploaded routes.
+
+    The BSC200 firmware uses ``route_plan_info_msg.status`` to flag
+    which route is currently being navigated:
+    ``enum_USED_STATUS = 1`` for the active route, ``enum_UNUSED_STATUS
+    = 2`` for every other entry. The library's ``nav-status`` command
+    consumes this — see ``RoutePlanViewModel.requestUsingRouteID`` in
+    the smali for the reference implementation. Other ROUTE_PLAN
+    operations (LIST_NUM_GET, FILE_DEL, RENAME) aren't simulated yet;
+    add them when a test requires them.
+
+    The real BSC200 doesn't strictly validate the framing-level
+    operation byte (it'll reply to LIST_GET even when the client
+    sets ``frame.operation = OP_GET = 2`` instead of the proto's
+    ``enum_ROUTE_PLAN_OPERATE_TYPE_LIST_GET = 1``); we mirror that
+    by checking the proto's ``route_plan_operate_type`` field
+    (which IS strictly checked) and accepting OP_GET as a fallback
+    so existing live-tested callers keep working.
+    """
+    proto_op = (
+        msg.route_plan_operate_type if isinstance(msg, route_plan_pb2.route_plan_data_msg) else 0
+    )
+    list_get = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_LIST_GET
+    if frame.operation != list_get and frame.operation != _client.OP_GET and proto_op != list_get:
+        return None
+    reply = route_plan_pb2.route_plan_data_msg()
+    reply.route_plan_operate_type = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_LIST_SEND
+    for entry in state.uploaded_routes:
+        info = reply.route_plan_info_msg.add()
+        info.id = entry.file_id
+        info.file_type = entry.file_type
+        info.name = entry.name
+        info.total_distance = entry.total_distance
+        info.status = (
+            route_plan_pb2.enum_USED_STATUS
+            if state.active_route_id == entry.file_id
+            else route_plan_pb2.enum_UNUSED_STATUS
+        )
+    return reply
+
+
 async def _handle_sensor(
     state: SimulatorState, frame: framing.Frame, _msg: Message
 ) -> Message | None:
@@ -291,6 +335,7 @@ class Simulator:
         common_pb2.enum_SERVICE_TYPE_INDEX_USER_CONFIG: _handle_user_config,
         common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA: _handle_cycling_data,
         common_pb2.enum_SERVICE_TYPE_INDEX_SENSOR: _handle_sensor,
+        common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN: _handle_route_plan,
     }
 
     def __init__(self, transport: Transport, state: SimulatorState | None = None):

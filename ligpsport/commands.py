@@ -360,27 +360,40 @@ async def _r_status(
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class NavStatus:
-    """Decoded ``DEV_STATUS.navi_status`` field.
+    """Result of the ``nav-status`` command.
 
-    The device reports navigation as a single byte (0 = off, 1 = on)
-    in every periodic ``DEV_STATUS SEND`` payload. We surface it as
-    its own command for tests and scripts that only care about the
-    nav state — no need to parse the whole real-time data block.
+    Surfaces whether the device is currently navigating a route and,
+    when it is, the file_id / name of the active route. The check
+    goes via ``ROUTE_PLAN LIST_GET`` (the iGPSPORT app's own
+    mechanism — see ``RoutePlanViewModel.requestUsingRouteID`` in
+    the smali): every route on the device carries a
+    ``ROUTE_PLAN_FILE_STATUS`` enum and the one currently being
+    navigated is tagged ``enum_USED_STATUS = 1``.
 
-    Values come straight from ``dev_status.proto``'s
-    ``DEV_NAVI_STATUS`` enum; the BSC200 firmware reports
-    ``DEV_NAVI_STATUS_ON`` (1) immediately after a successful
-    ``ROUTE_PLAN FILE_USE`` (see PROTOCOL.md §7.2 / §7.3).
+    ``DEV_STATUS.navi_status`` is documented in ``dev_status.proto``
+    but **the BSC200 firmware never populates it** — the field is
+    always 0 on the wire even while the device is actively
+    navigating. Verified against firmware 2024-05-14 via a live
+    DEV_STATUS GET. The route-list path is what the app uses and
+    what the library now uses.
     """
 
     is_navigating: bool
-    raw: int
+    active_route_id: int | None
+    active_route_name: str
 
     def to_dict(self) -> dict[str, object]:
-        return {"is_navigating": self.is_navigating, "raw": self.raw}
+        return {
+            "is_navigating": self.is_navigating,
+            "active_route_id": self.active_route_id,
+            "active_route_name": self.active_route_name,
+        }
 
     def format(self) -> str:
-        return f"Navigation: {'ON' if self.is_navigating else 'OFF'} (raw={self.raw})"
+        if not self.is_navigating:
+            return "Navigation: OFF"
+        rid = self.active_route_id if self.active_route_id is not None else "?"
+        return f"Navigation: ON  (route_id={rid} name={self.active_route_name!r})"
 
 
 async def _r_nav_status(
@@ -389,21 +402,40 @@ async def _r_nav_status(
     _args: Sequence[str],
     timeout: float,
 ) -> NavStatus:
-    """Read ``DEV_STATUS`` and report only ``navi_status``.
+    """Read the route-plan list and report which (if any) route is active.
 
-    A focused alternative to the ``status`` command for e2e tests
-    and CI scripts: returns a boolean ``is_navigating`` next to the
-    raw byte. The same DEV_STATUS GET request the full ``status``
-    command uses — the device replies with the same ``dev_status_msg``
-    and we just read ``navi_status``.
+    Mirrors ``RoutePlanViewModel.requestUsingRouteID`` in the iGPSPORT
+    app: send ``ROUTE_PLAN LIST_GET`` with an inclusive index range,
+    iterate the returned ``route_plan_info_msg`` entries, and pick
+    the one with ``status == enum_USED_STATUS (1)``. The earlier
+    implementation read ``DEV_STATUS.navi_status`` instead, but the
+    BSC200 firmware doesn't populate that field — it's always 0.
+
+    The ``file_index_start = 0`` / ``file_index_end = 100`` range is
+    a sufficient upper bound: the device's ``file_list_support_num_max``
+    (queryable via ``LIST_NUM_GET``) is 10 in current BSC200 firmware,
+    so any plausible route list fits.
     """
-    request = dev_status_pb2.dev_status_msg()
-    request.op_type = dev_status_pb2.enum_DEV_STATUS_OPERATE_TYPE_GET
+    request = route_plan_pb2.route_plan_data_msg()
+    request.route_plan_operate_type = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_LIST_GET
+    # The device returns an empty list if no `route_list_get_msg`
+    # range is supplied — verified against BSC200 firmware
+    # 2024-05-14. The Android app always sends start/end.
+    request.route_list_get_msg.file_index_start = 0
+    request.route_list_get_msg.file_index_end = 100
     response = await client.request(request, timeout=timeout)
     msg = response.message
-    if not isinstance(msg, dev_status_pb2.dev_status_msg):
+    if not isinstance(msg, route_plan_pb2.route_plan_data_msg):
         raise CommandError(f"unexpected response message: {type(msg).__name__}")
-    return NavStatus(is_navigating=msg.navi_status == 1, raw=int(msg.navi_status))
+    used = route_plan_pb2.enum_USED_STATUS
+    for entry in msg.route_plan_info_msg:
+        if entry.status == used:
+            return NavStatus(
+                is_navigating=True,
+                active_route_id=int(entry.id),
+                active_route_name=str(entry.name),
+            )
+    return NavStatus(is_navigating=False, active_route_id=None, active_route_name="")
 
 
 async def _r_user(
@@ -635,6 +667,13 @@ async def _r_routes(
 ) -> RouteList:
     request = route_plan_pb2.route_plan_data_msg()
     request.route_plan_operate_type = route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_LIST_GET
+    # Without an inclusive index range the BSC200 returns an empty
+    # list — verified live. The Android app's ``RoutePlanViewModel``
+    # always supplies start/end. ``file_list_support_num_max`` is 10
+    # on current firmware so a 0..100 window is comfortably more
+    # than any device's route list will ever hold.
+    request.route_list_get_msg.file_index_start = 0
+    request.route_list_get_msg.file_index_end = 100
     response = await client.request(request, timeout=timeout)
     msg = response.message
     if not isinstance(msg, route_plan_pb2.route_plan_data_msg):

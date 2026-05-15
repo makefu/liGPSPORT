@@ -776,27 +776,71 @@ reset directly — there is no BLE-level analog on the real device.
 
 ### 7.3 Checking whether navigation is currently active
 
-The device's ``DEV_STATUS SEND`` payload (service 13) carries
-``navi_status`` (``DEV_NAVI_STATUS`` enum from ``dev_status.proto`` —
-``0 = OFF``, ``1 = ON``) alongside every periodic status update. The
-library surfaces this in two ways:
+``dev_status.proto`` exposes a ``navi_status`` field on
+``dev_status_msg`` (``DEV_NAVI_STATUS`` enum — 0 = OFF, 1 = ON),
+which looks like the obvious place to check. **The BSC200
+firmware never populates it.** A live ``DEV_STATUS GET`` against
+firmware 2024-05-14 while the device is actively navigating
+"Hopfenhhe" returns ``navi_status = 0`` and ``DEV_STATUS SEND``
+notifications also leave it unset. The field exists in the proto
+but is dead on the wire.
 
-* :func:`ligpsport.commands._r_status` (CLI: ``status``) decodes the
-  full real-time block, with ``navi_status`` as one field of the
-  :class:`commands.DeviceStatus` dataclass.
-* :func:`ligpsport.commands._r_nav_status` (CLI: ``nav-status``) is
-  the focused variant — it issues the same ``DEV_STATUS GET``
-  request and returns just a :class:`commands.NavStatus` with
-  ``is_navigating: bool``. Use this in automation and e2e tests
-  where the rest of the status payload isn't needed.
+The iGPSPORT Android app uses a different mechanism, and so does
+the library. The signal is in ``ROUTE_PLAN LIST_GET``: every
+``route_plan_info_msg`` in the reply carries a
+``ROUTE_PLAN_FILE_STATUS`` byte (field 7), and the route currently
+being navigated is tagged ``enum_USED_STATUS = 1``; everything
+else is ``enum_UNUSED_STATUS = 2``. Reference implementation:
+``RoutePlanViewModel.requestUsingRouteID`` in ``smali-c5``, which
+iterates the list and picks the entry with ``getStatus() ==
+enum_USED_STATUS``.
 
-Both go through ``client.request`` against the DEV_STATUS service,
-so they work over any transport (BlueZ, bleak, loopback) and
-exercise the same code path that the simulator's
-``_handle_dev_status`` returns. The simulator flips
-``state.navi_status`` to ``1`` on every successful FILE_USE
-(``Simulator._handle_route_use``), making this checkable
-end-to-end without a real device.
+#### Wire format
+
+The LIST_GET request **must** include a ``route_list_get_msg``
+range — the BSC200 silently returns an empty list otherwise. The
+range fields are ``file_index_start`` (field 3) and
+``file_index_end`` (field 4) on ``file_list_get_message``; the
+Android app populates both. ``file_list_support_num_max`` on
+current firmware is 10, so any window wider than that is
+sufficient. The library uses ``[0, 100]``.
+
+Captured live response (BSC200 with five routes, "Hopfenhhe" active):
+
+```
+ROUTE_PLAN LIST_SEND reply, route_plan_info_msg entries:
+  id=1778803189 name="e2e-osrm"      type=CNX status=UNUSED
+  id=1778803520 name="e2e-osrm"      type=CNX status=UNUSED
+  id=1778803567 name="Pelikanschule" type=CNX status=UNUSED
+  id=1778803609 name="Hopfenhhe"     type=CNX status=USED     ← active
+  id=1778804267 name="e2e-osrm"      type=CNX status=UNUSED
+```
+
+#### Library binding
+
+* :func:`ligpsport.commands._r_nav_status` (CLI: ``nav-status``)
+  issues a ``ROUTE_PLAN LIST_GET`` with the 0..100 window, scans
+  for ``status == enum_USED_STATUS``, and returns
+  :class:`commands.NavStatus` with ``is_navigating``,
+  ``active_route_id`` and ``active_route_name``. Use this in
+  automation and e2e tests.
+
+  Live example::
+
+    $ ligpsport command --name bike nav-status --backend bluez
+    Navigation: ON  (route_id=1778803609 name='Hopfenhhe')
+
+* :func:`ligpsport.commands._r_routes` (CLI: ``routes``) uses the
+  same ``ROUTE_PLAN LIST_GET`` mechanism; each
+  :class:`commands.RoutePlan` entry exposes ``status`` so callers
+  can detect the active route themselves.
+
+The simulator's ``_handle_route_plan`` returns the same list
+shape: every entry from ``SimulatorState.uploaded_routes`` is
+tagged USED if its ``file_id`` matches
+``SimulatorState.active_route_id``, UNUSED otherwise. This makes
+the "upload + start navigation + verify active" loop hermetic
+without a real device.
 
 ## 8. Destructive operations
 
