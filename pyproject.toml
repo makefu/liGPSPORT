@@ -14,6 +14,7 @@ dependencies = [
     "bleak>=0.22",
     "protobuf>=4.25",
     "dbus-fast>=2.0; sys_platform == 'linux'",
+    "fitparse",
 ]
 
 [project.scripts]
@@ -54,3 +55,7 @@ warn_redundant_casts = true
 [[tool.mypy.overrides]]
 module = "ligpsport.proto.*"
 ignore_errors = true
+# fitparse ships no type stubs; treat its imports as ``Any``.
+[[tool.mypy.overrides]]
+module = "fitparse"
+ignore_missing_imports = true

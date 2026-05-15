@@ -29,14 +29,14 @@
             # so this only widens the wheel metadata, not the runtime
             # closure.
             python.pkgs.dbus-fast
+            # fitparse is the FIT reader used by ``ligpsport.fit_activity``
+            # to render downloaded activities as GPX.
+            python.pkgs.fitparse
           ];
           nativeBuildInputs = [ pkgs.ruff ];
           nativeCheckInputs = [
             python.pkgs.pytestCheckHook
             python.pkgs.pytest-asyncio
-            # fitparse is read-only — used by tests to verify our FIT
-            # course encoder round-trips. Not a runtime dependency.
-            python.pkgs.fitparse
           ];
           enabledTestPaths = [ "tests" ];
           pytestFlags = [ "-q" ];
@@ -63,6 +63,7 @@
                 ps.protobuf
                 ps.types-protobuf
                 ps.dbus-fast
+                ps.fitparse
               ]))
             ];
             src = ./.;
