@@ -67,7 +67,7 @@ from typing import TYPE_CHECKING, Final
 
 from . import client as _client_module
 from . import framing
-from .proto import common_pb2, cycling_data_pb2, route_plan_pb2
+from .proto import common_pb2, cycling_data_pb2, factory_pb2, route_plan_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -511,6 +511,39 @@ async def delete_all_activities(
         response = await asyncio.wait_for(queue.get(), timeout=timeout)
     finally:
         await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA, queue)
+    return int(response.frame.status)
+
+
+async def simulate_fit_files(
+    client: IgpsportClient,
+    *,
+    count: int,
+    size_bytes: int,
+    timeout: float = 30.0,
+) -> int:
+    """Ask the device to synthesise *count* fake FIT files of *size_bytes* each.
+
+    Wraps the FACTORY ``SIM_FIT_SET`` op (factory_operate_type = 7),
+    payload ``sim_fit_message { num, size }`` (factory.proto:92-96).
+    Mirrors ``IGPDeviceManager.simulateFitFile`` (smali ~28008): a
+    standard FACTORY service request on the control channel — the
+    same wire pattern :func:`commands._r_set_rtc` uses for RTC_SET.
+
+    The device generates *count* synthetic FIT files in its
+    recorded-activity flash (each ~*size_bytes*) and replies with a
+    ``DeviceReturnStatus`` byte. **Destructive**: consumes flash
+    space; clean up afterwards with ``del-activity`` or
+    ``delete-all-rides``.
+    """
+    request = factory_pb2.factory_msg()
+    request.factory_operate_type = factory_pb2.enum_FACTORY_OPERATE_TYPE_SIM_FIT_SET
+    request.sim_fit_msg.num = count
+    request.sim_fit_msg.size = size_bytes
+    response = await client.request(
+        request,
+        operation=factory_pb2.enum_FACTORY_OPERATE_TYPE_SIM_FIT_SET,
+        timeout=timeout,
+    )
     return int(response.frame.status)
 
 

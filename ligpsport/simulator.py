@@ -36,6 +36,7 @@ from .proto import (
     cycling_data_pb2,
     dev_status_pb2,
     dev_ver_info_pb2,
+    factory_pb2,
     route_plan_pb2,
     sensor_pb2,
     user_config_pb2,
@@ -399,6 +400,82 @@ async def _handle_route_plan(
     return reply
 
 
+def _make_fake_fit(size: int) -> bytes:
+    """Build *size* bytes that pass the BSC200's FIT-magic check.
+
+    The real device stores valid FIT files (12-byte header, records,
+    CRC footer). Tests don't need that — they only need the magic at
+    bytes 8..11 so :class:`ligpsport.commands.DownloadedFile`'s
+    ``fit_magic`` flag flips to True. ``data_size`` (bytes 4..7,
+    little-endian) is the only other field the magic check care
+    about; we fill it in with ``size - 16`` so the header is
+    internally consistent for inspectors that look past the magic.
+    """
+    if size < 12:
+        return (b"\x0e\x10\x54\x08" + b"\x00" * 4 + b".FIT")[:size]
+    data_size = max(0, size - 16).to_bytes(4, "little")
+    header = b"\x0e\x10\x54\x08" + data_size + b".FIT"
+    return header + b"\x00" * (size - len(header))
+
+
+async def _handle_factory(
+    state: SimulatorState, frame: framing.Frame, msg: Message
+) -> Message | None:
+    """Handle FACTORY ops: today only ``SIM_FIT_SET``.
+
+    Mirrors the BSC200's wired-up ``IGPDeviceManager.simulateFitFile``
+    behaviour (factory.proto:92-96 + smali ~28008): the device
+    appends *num* synthetic FIT files of *size* bytes each to its
+    recorded-activity flash, then ACKs with a status byte.
+
+    The simulator does the same — appends to
+    :attr:`SimulatorState.ride_files` so the next ``LIST_GET`` /
+    ``FILE_GET`` round-trip sees them — but only when
+    ``allow_destructive=True``. Without the opt-in the simulator
+    refuses with ``status=6`` (UnsupportedCommand), mirroring the
+    runtime gate the CLI / library use.
+    """
+    sim_fit_set = factory_pb2.enum_FACTORY_OPERATE_TYPE_SIM_FIT_SET
+    proto_op = msg.factory_operate_type if isinstance(msg, factory_pb2.factory_msg) else 0
+    if frame.operation != sim_fit_set and proto_op != sim_fit_set:
+        return None
+    if not state.allow_destructive:
+        _LOG.warning("simulator: refusing FACTORY SIM_FIT_SET (allow_destructive=False)")
+        return _ConfirmReply(
+            service=common_pb2.enum_SERVICE_TYPE_INDEX_FACTORY,
+            operation=sim_fit_set,
+            status=6,
+        )  # type: ignore[return-value]
+    if not isinstance(msg, factory_pb2.factory_msg):
+        return None
+    count = int(msg.sim_fit_msg.num)
+    size = int(msg.sim_fit_msg.size)
+    import time as _time
+
+    base = int(_time.time())
+    # Stagger timestamps so each synthetic entry is uniquely
+    # addressable by FILE_GET / FILE_DEL — the device's flash uses
+    # the FIT start-timestamp as the on-wire id.
+    used = {entry.timestamp for entry in state.ride_files}
+    for i in range(count):
+        ts = base + i
+        while ts in used:
+            ts += 1
+        used.add(ts)
+        state.ride_files.append(
+            SimulatedRideFile(
+                timestamp=ts,
+                file_size=size,
+                content=_make_fake_fit(size),
+            )
+        )
+    return _ConfirmReply(
+        service=common_pb2.enum_SERVICE_TYPE_INDEX_FACTORY,
+        operation=sim_fit_set,
+        status=0,
+    )  # type: ignore[return-value]
+
+
 async def _handle_sensor(
     state: SimulatorState, frame: framing.Frame, _msg: Message
 ) -> Message | None:
@@ -445,6 +522,7 @@ class Simulator:
         common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA: _handle_cycling_data,
         common_pb2.enum_SERVICE_TYPE_INDEX_SENSOR: _handle_sensor,
         common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN: _handle_route_plan,
+        common_pb2.enum_SERVICE_TYPE_INDEX_FACTORY: _handle_factory,
     }
 
     def __init__(self, transport: Transport, state: SimulatorState | None = None):

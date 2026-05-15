@@ -1063,6 +1063,75 @@ async def _r_delete_ride(
     )
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class SimActivityResult:
+    """Outcome of the ``sim-activity`` command.
+
+    The device generates *count* synthetic FIT files of *size_bytes*
+    each in its recorded-activity flash. *status* is the
+    ``DeviceReturnStatus`` ordinal from the ACK frame (0 = Success).
+    """
+
+    count: int
+    size_bytes: int
+    status: int
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        result = "ok" if self.status == 0 else f"error (status={self.status})"
+        return (
+            f"sim-activity: requested {self.count} file"
+            f"{'s' if self.count != 1 else ''} of {self.size_bytes} bytes — {result}"
+        )
+
+
+async def _r_sim_activity(
+    _spec: CommandSpec,
+    client: _client.IgpsportClient,
+    args: Sequence[str],
+    timeout: float,
+) -> SimActivityResult:
+    """Ask the device to generate fake FIT files in its activity flash.
+
+    Wraps :func:`file_transfer.simulate_fit_files` (FACTORY service,
+    ``SIM_FIT_SET`` op = 7). Accepts ``count=N`` and ``size=BYTES``
+    inline-arg pairs; defaults are ``count=1, size=4096`` — one
+    small file, fast to clean up with ``del-activity`` or
+    ``delete-all-rides``.
+    """
+    count = 1
+    size_bytes = 4096
+    for arg in args:
+        if "=" not in arg:
+            raise CommandError(f"expected key=value, got {arg!r}")
+        k, _, v = arg.partition("=")
+        if k == "count":
+            try:
+                count = int(v)
+            except ValueError as exc:
+                raise CommandError(f"sim-activity: count must be an integer, got {v!r}") from exc
+        elif k == "size":
+            try:
+                size_bytes = int(v)
+            except ValueError as exc:
+                raise CommandError(f"sim-activity: size must be an integer, got {v!r}") from exc
+        else:
+            raise CommandError(f"sim-activity: unknown key {k!r} (expected count= or size=)")
+    if count < 1:
+        raise CommandError(f"sim-activity: count must be >= 1, got {count}")
+    if size_bytes < 1:
+        raise CommandError(f"sim-activity: size must be >= 1, got {size_bytes}")
+    status = await file_transfer.simulate_fit_files(
+        client,
+        count=count,
+        size_bytes=size_bytes,
+        timeout=max(30.0, timeout),
+    )
+    return SimActivityResult(count=count, size_bytes=size_bytes, status=status)
+
+
 async def _r_delete_all_rides(
     _spec: CommandSpec,
     client: _client.IgpsportClient,
@@ -1465,6 +1534,23 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
         runner=_r_delete_all_rides,
         destructive=True,
         danger="Erases all recorded ride history. No recovery once issued.",
+    ),
+    "sim-activity": CommandSpec(
+        name="sim-activity",
+        description=(
+            "Ask the device to generate fake FIT files in its "
+            "recorded-activity flash. Useful for re-testing the "
+            "delete / download paths without physically riding the "
+            "bike. Syntax: sim-activity [count=N] [size=BYTES] "
+            "(defaults count=1 size=4096). Destructive."
+        ),
+        runner=_r_sim_activity,
+        destructive=True,
+        danger=(
+            "Writes synthetic FIT files into the BSC200's recorded-"
+            "activity flash. Consumes flash space; clean up with "
+            "delete-all-rides or del-activity."
+        ),
     ),
 }
 

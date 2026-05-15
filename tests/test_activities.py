@@ -21,6 +21,7 @@ from ligpsport.commands import (
     ActivityList,
     DelActivityResult,
     DownloadedFile,
+    SimActivityResult,
     run_named,
 )
 from ligpsport.simulator import (
@@ -293,3 +294,61 @@ async def test_del_activity_command_is_destructive() -> None:
     assert spec.danger is not None
     # Same for the legacy alias.
     assert get_command("delete-ride").destructive is True
+
+
+async def test_sim_activity_gated() -> None:
+    """Without ``allow_destructive=True`` the registry refuses ``sim-activity``."""
+    from ligpsport.commands import DestructiveCommandError
+
+    client_t, peer_t = make_loopback_pair()
+    async with Simulator(peer_t, SimulatorState()), IgpsportClient(client_t) as client:
+        with pytest.raises(DestructiveCommandError):
+            await run_named(client, "sim-activity", args=("count=1", "size=2048"))
+
+
+async def test_sim_activity_creates_entries(tmp_path) -> None:
+    """``sim-activity count=2 size=2048`` populates two downloadable entries."""
+    state = SimulatorState(allow_destructive=True)
+    client_t, peer_t = make_loopback_pair()
+    async with Simulator(peer_t, state), IgpsportClient(client_t) as client:
+        result = await run_named(
+            client,
+            "sim-activity",
+            args=("count=2", "size=2048"),
+            allow_destructive=True,
+        )
+        listing = await run_named(client, "list-activities")
+        assert isinstance(listing.value, ActivityList)
+        assert len(listing.value.files) == 2
+
+        out_paths = []
+        for entry in listing.value.files:
+            out = tmp_path / f"{entry.timestamp}.fit"
+            download = await run_named(
+                client,
+                "download-activity",
+                args=(str(entry.timestamp), str(out)),
+                timeout=10.0,
+            )
+            assert isinstance(download.value, DownloadedFile)
+            assert download.value.size_bytes == 2048
+            out_paths.append(out)
+
+    assert isinstance(result.value, SimActivityResult)
+    assert result.value.count == 2
+    assert result.value.size_bytes == 2048
+    assert result.value.status == 0
+    assert len(state.ride_files) == 2
+    for path in out_paths:
+        data = path.read_bytes()
+        assert data[8:12] == b".FIT"
+
+
+async def test_sim_activity_destructive_marker() -> None:
+    """The registry entry is destructive and the prefix list covers FACTORY/SIM_FIT_SET."""
+    from ligpsport.commands import DESTRUCTIVE_PREFIXES, get_command
+
+    spec = get_command("sim-activity")
+    assert spec.destructive is True
+    assert spec.danger is not None
+    assert (11, 7) in DESTRUCTIVE_PREFIXES
