@@ -37,6 +37,7 @@ from .transport import Channel, Transport, TransportClosed
 _CHANNEL_RX_UUID: Final[dict[Channel, str]] = {
     "control": gatt.PRIMARY_RX_UUID,
     "data": gatt.DATA_RX_UUID,
+    "third": gatt.THIRD_RX_UUID,
     "fourth": gatt.FOURTH_RX_UUID,
 }
 
@@ -176,14 +177,26 @@ class BleakTransport(Transport):
             if self._rx_expected is None:
                 if len(self._rx_buf) < framing.HEADER_SIZE:
                     return  # not enough yet to learn total frame size
+                head = bytes(self._rx_buf[: framing.HEADER_SIZE])
                 try:
-                    self._rx_expected = framing.expected_total_size(
-                        bytes(self._rx_buf[: framing.HEADER_SIZE])
-                    )
+                    self._rx_expected = framing.expected_total_size(head)
                 except framing.FrameError as exc:
                     _LOG.warning("malformed header; dropping buffer: %s", exc)
                     self._rx_buf.clear()
                     return
+                if self._rx_expected is None:
+                    # Transmit-complete download stream (file_tag=0x55).
+                    # The head's payload_size is bogus; the actual length
+                    # comes from the embedded file_download protobuf.
+                    try:
+                        total = framing.transmit_complete_total_size(bytes(self._rx_buf))
+                    except framing.FrameError as exc:
+                        _LOG.warning("malformed transmit-complete head: %s", exc)
+                        self._rx_buf.clear()
+                        return
+                    if total is None:
+                        return  # need more bytes to learn the size
+                    self._rx_expected = total
             assert self._rx_expected is not None
             if len(self._rx_buf) < self._rx_expected:
                 return  # wait for more chunks

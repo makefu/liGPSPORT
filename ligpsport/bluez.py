@@ -77,6 +77,7 @@ TX_UUIDS: Final[tuple[str, ...]] = (
 _CHANNEL_RX_UUID: Final[dict[Channel, str]] = {
     "control": gatt.PRIMARY_RX_UUID,
     "data": gatt.DATA_RX_UUID,
+    "third": gatt.THIRD_RX_UUID,
     "fourth": gatt.FOURTH_RX_UUID,
 }
 
@@ -496,14 +497,23 @@ class BluezTransport(Transport):
             if self._rx_expected is None:
                 if len(self._rx_buf) < framing.HEADER_SIZE:
                     return
+                head = bytes(self._rx_buf[: framing.HEADER_SIZE])
                 try:
-                    self._rx_expected = framing.expected_total_size(
-                        bytes(self._rx_buf[: framing.HEADER_SIZE])
-                    )
+                    self._rx_expected = framing.expected_total_size(head)
                 except framing.FrameError as exc:
                     _LOG.warning("BlueZ: dropping malformed header: %s", exc)
                     self._rx_buf.clear()
                     return
+                if self._rx_expected is None:
+                    try:
+                        total = framing.transmit_complete_total_size(bytes(self._rx_buf))
+                    except framing.FrameError as exc:
+                        _LOG.warning("BlueZ: malformed transmit-complete head: %s", exc)
+                        self._rx_buf.clear()
+                        return
+                    if total is None:
+                        return
+                    self._rx_expected = total
             assert self._rx_expected is not None
             if len(self._rx_buf) < self._rx_expected:
                 return

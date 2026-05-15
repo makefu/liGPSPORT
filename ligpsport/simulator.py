@@ -53,12 +53,19 @@ Handler = Callable[
 
 @dataclasses.dataclass(slots=True)
 class SimulatedRideFile:
-    """One entry in the simulator's cycling-data file list."""
+    """One entry in the simulator's recorded-activity file list."""
 
     timestamp: int
     file_size: int
     user_id: str = ""
     device_id: str = ""
+    content: bytes = b""
+    """The on-device FIT bytes — served when the client sends FILE_GET.
+
+    Empty by default so existing tests that only exercise LIST_GET
+    still work. Tests that exercise the download path populate this
+    with enough bytes to match :attr:`file_size`.
+    """
 
 
 @dataclasses.dataclass(slots=True)
@@ -231,19 +238,121 @@ async def _handle_user_config(
 
 
 async def _handle_cycling_data(
-    state: SimulatorState, frame: framing.Frame, _msg: Message
+    state: SimulatorState, frame: framing.Frame, msg: Message
 ) -> Message | None:
-    if frame.operation != cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_GET:
-        return None
-    reply = cycling_data_pb2.cycling_data_msg()
-    reply.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_SEND
-    for f in state.ride_files:
-        entry = reply.cycling_data_file_flag_msg.add()
-        entry.timestamp = f.timestamp
-        entry.file_size = f.file_size
-        entry.user_id = f.user_id
-        entry.device_id = f.device_id
-    return reply
+    """Handle CYCLING_DATA ops: LIST_GET / FILE_GET / FILE_DEL / ALL_DEL.
+
+    The wire-level distinguishing fields:
+
+    * ``LIST_GET`` (op=1, file_tag=0xFF): reply with one
+      ``cycling_data_file_flag_msg`` per entry in
+      :attr:`SimulatorState.ride_files`.
+    * ``FILE_GET`` (op=3, file_tag=0x55): reply with a single
+      transmit-complete PbFrame: 20-byte head with
+      ``file_tag=0x55`` and ``end_marker=0x03``, then 4-byte BE
+      ``pb_size``, a ``file_download`` protobuf carrying
+      ``file_size``, then the raw file bytes. The 20-byte head's
+      ``payload_size`` field is intentionally bogus on the BSC200
+      (the firmware writes 0x07a7 / 1959 regardless of the actual
+      stream length); we mirror that quirk so the framing layer's
+      transmit-complete path is exercised end-to-end.
+    * ``FILE_DEL`` (op=5): drop the matching entry from
+      ``ride_files`` and ACK with status=0.
+    * ``ALL_DEL`` (op=6): clear ``ride_files`` and ACK with
+      status=0.
+
+    Returns ``None`` for ``LIST_NUM_GET`` and ``AUTO_UPLOAD`` ops —
+    the simulator doesn't claim to model those today.
+    """
+    proto_op = (
+        msg.cycling_data_operate_type if isinstance(msg, cycling_data_pb2.cycling_data_msg) else 0
+    )
+    op = proto_op or frame.operation
+
+    if op == cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_GET:
+        reply = cycling_data_pb2.cycling_data_msg()
+        reply.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_SEND
+        for f in state.ride_files:
+            entry = reply.cycling_data_file_flag_msg.add()
+            entry.timestamp = f.timestamp
+            entry.file_size = f.file_size
+            entry.user_id = f.user_id
+            entry.device_id = f.device_id
+        return reply
+
+    if op == cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_GET:
+        flags = (
+            msg.cycling_data_file_flag_msg
+            if isinstance(msg, cycling_data_pb2.cycling_data_msg)
+            else ()
+        )
+        if not flags:
+            return None
+        timestamp = flags[0].timestamp
+        target = next((f for f in state.ride_files if f.timestamp == timestamp), None)
+        # The simulator hands the transmit-complete stream back
+        # through a sentinel return value the dispatcher recognises;
+        # see :meth:`Simulator._handle_one`.
+        return _TransmitCompleteReply(target)  # type: ignore[return-value]
+
+    if op == cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_DEL:
+        if not state.allow_destructive:
+            _LOG.warning("simulator: refusing CYCLING_DATA FILE_DEL (allow_destructive=False)")
+            return _ConfirmReply(
+                service=common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA,
+                operation=op,
+                status=6,  # UnsupportedCommand
+            )  # type: ignore[return-value]
+        flags = (
+            msg.cycling_data_file_flag_msg
+            if isinstance(msg, cycling_data_pb2.cycling_data_msg)
+            else ()
+        )
+        if flags:
+            target_ts = flags[0].timestamp
+            state.ride_files = [f for f in state.ride_files if f.timestamp != target_ts]
+        return _ConfirmReply(
+            service=common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA,
+            operation=op,
+            status=0,
+        )  # type: ignore[return-value]
+
+    if op == cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_ALL_DEL:
+        if not state.allow_destructive:
+            _LOG.warning("simulator: refusing CYCLING_DATA ALL_DEL (allow_destructive=False)")
+            return _ConfirmReply(
+                service=common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA,
+                operation=op,
+                status=6,
+            )  # type: ignore[return-value]
+        state.ride_files = []
+        return _ConfirmReply(
+            service=common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA,
+            operation=op,
+            status=0,
+        )  # type: ignore[return-value]
+    return None
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class _ConfirmReply:
+    """Sentinel: dispatcher should emit a 20-byte TYPE_CONFIRM frame.
+
+    Handler-return signalling channel — the simulator dispatcher
+    recognises this and writes a ``ConfirmFrame`` instead of going
+    through ``envelope.encode_message``.
+    """
+
+    service: int
+    operation: int
+    status: int = 0
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class _TransmitCompleteReply:
+    """Sentinel: dispatcher should emit a transmit-complete download stream."""
+
+    target: SimulatedRideFile | None
 
 
 async def _handle_route_plan(
@@ -469,6 +578,31 @@ class Simulator:
         reply = await handler(self.state, frame, msg)
         if reply is None:
             return
+        if isinstance(reply, _ConfirmReply):
+            # Synthesise a 20-byte TYPE_CONFIRM frame and write it
+            # back. Used by the CYCLING_DATA FILE_DEL / ALL_DEL ACKs
+            # (PROTOCOL.md §6.4) and any future sentinel-driven
+            # responses that don't fit the protobuf reply model.
+            await self._transport.send(
+                framing.build_frame(
+                    framing.Frame(
+                        type=framing.TYPE_CONFIRM,
+                        service=reply.service,
+                        operation=reply.operation,
+                        status=reply.status,
+                    )
+                )
+            )
+            return
+        if isinstance(reply, _TransmitCompleteReply):
+            # CYCLING_DATA FILE_GET reply: build the transmit-complete
+            # stream the BSC200 sends (PROTOCOL.md §6.4):
+            #   [20B head, file_tag=0x55, op=FILE_SEND(4), end=0x03]
+            #   [4B BE pb_size]
+            #   [file_download protobuf]
+            #   [file_size raw FIT bytes]
+            await self._send_activity_file(reply.target)
+            return
         service_type, payload = envelope.encode_message(reply)
         out_frame = framing.Frame(
             service=service_type,
@@ -476,6 +610,56 @@ class Simulator:
             payload=payload,
         )
         await self._transport.send(framing.build_frame(out_frame))
+
+    async def _send_activity_file(self, target: SimulatedRideFile | None) -> None:
+        """Emit a transmit-complete CYCLING_DATA FILE_SEND stream for *target*.
+
+        Mirrors the BSC200 firmware's observed wire format byte-for-byte
+        (see ``tmp/decode_full.py`` + PROTOCOL.md §6.4). The 20-byte
+        head's ``payload_size`` field is intentionally bogus on the
+        BSC200 — the embedded ``file_download.file_size`` is
+        authoritative. We mirror the quirk so tests exercising the
+        client's transmit-complete decoder also exercise the
+        framing layer's :func:`framing.transmit_complete_total_size`
+        path. *target* may be ``None`` when the client asks for a
+        timestamp that doesn't exist on the device; in that case
+        the simulator emits a zero-length stream so the client sees
+        an explicit "no file" reply.
+        """
+        from .proto import file_download_pb2
+
+        if target is None:
+            file_bytes = b""
+            pb_msg = file_download_pb2.file_download()
+            pb_msg.file_size = 0
+        else:
+            file_bytes = target.content
+            pb_msg = file_download_pb2.file_download()
+            pb_msg.file_size = target.file_size
+        pb_bytes = pb_msg.SerializeToString()
+        # Bogus payload_size — see PROTOCOL.md §6.4. The real
+        # BSC200 writes 0x07a7 (1959). Match it so the framing
+        # layer's CRC-relaxation also gets exercised end-to-end.
+        bogus_size = 0x07A7
+        head = bytearray(framing.HEADER_SIZE)
+        head[framing.HDR_TYPE] = framing.TYPE_PB
+        head[framing.HDR_SERVICE] = common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA & 0xFF
+        head[framing.HDR_SUB_SERVICE] = 0xFF
+        head[framing.HDR_FILE_TAG] = framing.FILE_TAG_TRANSMIT_COMPLETE
+        head[framing.HDR_OPERATION] = (
+            cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_SEND & 0xFF
+        )
+        head[framing.HDR_SUB_OPERATION] = 0xFF
+        head[framing.HDR_RESERVED_6] = 0xFF
+        head[framing.HDR_PAYLOAD_SIZE] = (bogus_size >> 8) & 0xFF
+        head[framing.HDR_PAYLOAD_SIZE + 1] = bogus_size & 0xFF
+        head[framing.HDR_PAYLOAD_CRC] = 0
+        head[framing.HDR_END_MARKER] = 0x03  # last chunk
+        for off in range(11, 19):
+            head[off] = 0xFF
+        head[framing.HDR_HEADER_CRC] = framing.crc8(bytes(head[: framing.HDR_HEADER_CRC]))
+        wire = bytes(head) + len(pb_bytes).to_bytes(4, "big") + pb_bytes + file_bytes
+        await self._transport.send(wire)
 
     @staticmethod
     def _match_route_chunk(chunk: bytes, header: bytes) -> tuple[int, int] | None:

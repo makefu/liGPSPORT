@@ -59,12 +59,13 @@ This module exposes :func:`download_cycling_data` and
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import dataclasses
 import logging
 import math
 import struct
 from typing import TYPE_CHECKING, Final
 
+from . import client as _client_module
 from . import framing
 from .proto import common_pb2, cycling_data_pb2, route_plan_pb2
 
@@ -218,6 +219,23 @@ class NavigationStartError(RuntimeError):
         self.file_id = file_id
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class ActivityDownload:
+    """Result of an activity ``FILE_GET`` exchange.
+
+    *file_size* is the size declared in the device's embedded
+    ``file_download`` protobuf (PROTOCOL.md §6.4); it matches the
+    ``file_size`` reported by the preceding ``LIST_GET`` entry.
+    *file_id* and *file_name* are usually 0 / "" — the BSC200
+    firmware doesn't populate them.
+    """
+
+    content: bytes
+    file_size: int
+    file_id: int
+    file_name: str
+
+
 async def download_cycling_data(
     client: IgpsportClient,
     *,
@@ -226,59 +244,301 @@ async def download_cycling_data(
     chunk_timeout: float = 10.0,
     overall_timeout: float = 300.0,
 ) -> bytes:
-    """Download one recorded ride file from the device.
+    """Download one recorded activity file from the device (FIT bytes).
 
-    *timestamp* is the file identifier from the cycling-data list. If
-    *expected_size* is provided (e.g. from a prior LIST_GET) the
-    downloader returns as soon as it has accumulated that many bytes;
-    otherwise it keeps consuming chunks until ``overall_timeout``
-    expires without a fresh chunk.
-
-    Raises :class:`asyncio.TimeoutError` if the device stops sending
-    before all bytes arrive.
+    Thin wrapper around :func:`download_activity` for callers that only
+    want the file content. *expected_size* is accepted for backwards
+    compatibility but ignored — the embedded ``file_download`` protobuf
+    carries the authoritative length, and the transmit-complete
+    framing path always returns a complete file or raises.
     """
-    # Subscribe to unsolicited CYCLING_DATA frames before sending the
-    # request; the device may start replying before the request future
-    # resolves, and the response itself usually IS the first chunk.
-    request = cycling_data_pb2.cycling_data_msg()
-    request.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_GET
-    flag = request.cycling_data_file_flag_msg.add()
+    del expected_size  # tolerated for backwards compat; size comes from device
+    result = await download_activity(
+        client,
+        timestamp=timestamp,
+        timeout=max(overall_timeout, chunk_timeout),
+    )
+    return result.content
+
+
+async def download_activity(
+    client: IgpsportClient,
+    *,
+    timestamp: int,
+    timeout: float = 60.0,
+) -> ActivityDownload:
+    """Download one recorded activity by *timestamp*.
+
+    Mirrors ``IGPDeviceManager.readActivityFitFile`` (smali line
+    1424-1450) for gen-4 devices like the BSC200:
+
+    1. Build a ``cycling_data_msg`` with ``FILE_GET`` + one
+       ``cycling_data_file_flag_message`` carrying the timestamp.
+    2. Wrap the serialised protobuf in a 20-byte head with
+       ``file_tag = 0x55`` (the ``TransmitCompleteCommand`` magic
+       from the smali — without it the BSC200 silently ignores the
+       request).
+    3. Single merged write of ``(head ‖ body)`` to the **third UART
+       RX** (``…-7e``) — verified against btsnoop frame 35365 of
+       ``snoop_start.log`` and live tests against firmware 2024-05-14.
+    4. The device replies with a single transmit-complete PbFrame on
+       the third TX: ``[20B head, file_tag=0x55, end_marker=0x03] ‖
+       [4B BE pb_size] ‖ [file_download protobuf] ‖ [file_size
+       bytes of FIT]``. The 20-byte head's ``payload_size`` field is
+       bogus on this firmware (0x07a7 = 1959 for a 15572-byte file);
+       the embedded protobuf is authoritative. The reassembly path
+       in :func:`framing.transmit_complete_total_size` already
+       handles this; we just consume the resulting Frame here.
+
+    Raises :class:`asyncio.TimeoutError` if no reply arrives within
+    *timeout* seconds. Raises :class:`ProtocolError` if the response
+    head doesn't look like a FILE_SEND reply.
+    """
+    pb = cycling_data_pb2.cycling_data_msg()
+    pb.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA
+    pb.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_GET
+    flag = pb.cycling_data_file_flag_msg.add()
     flag.timestamp = timestamp
+    body = pb.SerializeToString()
+    head = _build_cycling_data_head(
+        body,
+        op=cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_GET,
+        file_tag=framing.FILE_TAG_TRANSMIT_COMPLETE,
+    )
+    wire = head + body
 
-    accumulated = bytearray()
-    deadline = asyncio.get_running_loop().time() + overall_timeout
-
-    async def consume(sub_iter):
-        nonlocal accumulated
-        async for response in sub_iter:
-            if not isinstance(response.message, cycling_data_pb2.cycling_data_msg):
-                continue
-            chunk = response.message.file_content
-            if chunk:
-                accumulated.extend(chunk)
-                _LOG.debug("ride chunk: +%d bytes (total %d)", len(chunk), len(accumulated))
-            if expected_size is not None and len(accumulated) >= expected_size:
-                return
-            if asyncio.get_running_loop().time() > deadline:
-                return
-
-    sub_iter = client.subscribe(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA)
-    consumer = asyncio.create_task(consume(sub_iter))
+    queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA)
     try:
-        response = await client.request(request, timeout=chunk_timeout)
-        if isinstance(response.message, cycling_data_pb2.cycling_data_msg):
-            chunk = response.message.file_content
-            if chunk:
-                accumulated.extend(chunk)
-
-        if expected_size is None or len(accumulated) < expected_size:
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(consumer, timeout=overall_timeout)
+        await client._transport.send(wire, channel="third")
+        response = await asyncio.wait_for(queue.get(), timeout=timeout)
     finally:
-        consumer.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await consumer
-    return bytes(accumulated)
+        await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA, queue)
+
+    frame = response.frame
+    if frame.operation != cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_SEND:
+        raise _client_module.ProtocolError(
+            f"activity FILE_GET: expected FILE_SEND reply, got op={frame.operation}"
+        )
+    payload = frame.payload
+    if len(payload) < 4:
+        raise _client_module.ProtocolError(
+            f"activity FILE_GET: reply payload too short ({len(payload)} bytes)"
+        )
+    pb_size = struct.unpack(">I", payload[:4])[0]
+    if len(payload) < 4 + pb_size:
+        raise _client_module.ProtocolError(
+            f"activity FILE_GET: pb_size={pb_size} exceeds payload ({len(payload)})"
+        )
+    from .proto import file_download_pb2
+
+    info = file_download_pb2.file_download()
+    info.ParseFromString(payload[4 : 4 + pb_size])
+    file_start = 4 + pb_size
+    file_end = file_start + info.file_size
+    if len(payload) < file_end:
+        raise _client_module.ProtocolError(
+            f"activity FILE_GET: short payload {len(payload)} < {file_end}"
+        )
+    return ActivityDownload(
+        content=bytes(payload[file_start:file_end]),
+        file_size=int(info.file_size),
+        file_id=int(info.file_id),
+        file_name=str(info.file_name),
+    )
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ActivityListEntry:
+    """One entry in a ``CYCLING_DATA`` LIST_GET reply."""
+
+    timestamp: int
+    file_size: int
+    user_id: str
+    device_id: str
+
+
+async def list_activities(
+    client: IgpsportClient,
+    *,
+    file_index_start: int = 0,
+    file_index_end: int = 100,
+    timeout: float = 10.0,
+) -> tuple[ActivityListEntry, ...]:
+    """Return the device's recorded-activity list.
+
+    Sends ``CYCLING_DATA LIST_GET`` (op=1) with an inclusive index
+    range. The smali for gen-4 devices populates a ``file_list_get_msg``
+    with start/end values; mirrors ``ROUTE_PLAN LIST_GET``'s expected
+    range argument. The BSC200 firmware ignores values outside the
+    range but returns all entries when the range covers the whole
+    list. Default ``[0, 100]`` is well above the firmware's
+    ``file_list_support_num_max`` cap of 20.
+
+    Sent on the **third UART RX** (``…-7e``) — the iGPSPORT app's
+    smali (``IGPDeviceManager.readActivityList``) routes
+    ``thirdQueue`` for generation ≥ 3, and the btsnoop capture
+    (``snoop_start.log`` frame 35365) confirms the wire path.
+    """
+    pb = cycling_data_pb2.cycling_data_msg()
+    pb.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA
+    pb.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_GET
+    pb.list_msg.file_index_start = file_index_start
+    pb.list_msg.file_index_end = file_index_end
+    body = pb.SerializeToString()
+    head = _build_cycling_data_head(
+        body,
+        op=cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_GET,
+        file_tag=framing.FILE_TAG_DEFAULT,
+    )
+    queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA)
+    try:
+        await client._transport.send(head + body, channel="third")
+        response = await asyncio.wait_for(queue.get(), timeout=timeout)
+    finally:
+        await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA, queue)
+    msg = response.message
+    if not isinstance(msg, cycling_data_pb2.cycling_data_msg):
+        raise _client_module.ProtocolError(f"unexpected response message: {type(msg).__name__}")
+    return tuple(
+        ActivityListEntry(
+            timestamp=int(f.timestamp),
+            file_size=int(f.file_size),
+            user_id=str(f.user_id),
+            device_id=str(f.device_id),
+        )
+        for f in msg.cycling_data_file_flag_msg
+        # The BSC200 firmware pads the response with zero entries
+        # (timestamp=0, file_size=0) up to the list_support_num_max
+        # cap. Drop those so callers see real entries only.
+        if f.timestamp != 0 or f.file_size != 0
+    )
+
+
+async def delete_activity(
+    client: IgpsportClient,
+    timestamp: int,
+    *,
+    timeout: float = 10.0,
+) -> int:
+    """Delete one activity file from the device by ``timestamp``.
+
+    Mirrors ``IGPDeviceManager.deleteActivityFitFile`` (smali line
+    6464+) for gen-4 devices: builds a ``cycling_data_msg`` with
+    ``FILE_DEL`` (op=5) and one
+    ``cycling_data_file_flag_message`` carrying the timestamp; for
+    gen ≥ 3 the smali pushes onto ``thirdQueue`` — the **third UART
+    RX** (``…-7e``), same channel as LIST_GET and FILE_GET.
+
+    For gen-4 specifically, the smali calls
+    ``byteMerger(dataPair.second, dataPair.first)`` so the head and
+    body go out as a **single merged write**; pre-gen-4 splits them
+    body-on-data + header-on-control. The merged-write pattern
+    matches the route_plan ``FILES_DEL`` path we already exercise.
+
+    The device replies with a ``CYCLING_DATA FILE_DEL`` confirm
+    frame; the status byte at offset 7 is the
+    ``DeviceReturnStatus`` ordinal (0 = success).
+
+    **Destructive — never call this without explicit user
+    confirmation.** The on-device flash entry for the activity is
+    erased and not recoverable.
+    """
+    pb = cycling_data_pb2.cycling_data_msg()
+    pb.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA
+    pb.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_DEL
+    flag = pb.cycling_data_file_flag_msg.add()
+    flag.timestamp = timestamp
+    body = pb.SerializeToString()
+    head = _build_cycling_data_head(
+        body,
+        op=cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_DEL,
+        file_tag=framing.FILE_TAG_DEFAULT,
+    )
+    queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA)
+    try:
+        await client._transport.send(head + body, channel="third")
+        response = await asyncio.wait_for(queue.get(), timeout=timeout)
+    finally:
+        await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA, queue)
+    return int(response.frame.status)
+
+
+async def delete_all_activities(
+    client: IgpsportClient,
+    *,
+    timeout: float = 10.0,
+) -> int:
+    """Delete *every* recorded activity from the device. **Destructive.**
+
+    Mirrors ``IGPDeviceManager.deleteAllActivityFitFile`` (smali line
+    6742+): unlike ``FILE_DEL`` (which gen-4 sends as a merged
+    ``byteMerger(header ‖ body)`` write on the third UART), ALL_DEL
+    uses the **split** write pattern even on gen-4. ``BaseCommand``
+    is constructed with ``sendData = body`` and
+    ``confirmData = header``; ``BaseCommand.run`` writes the body on
+    the chosen characteristic and the lambda follow-up writes the
+    20-byte head on the control channel. Mirror that wire pattern:
+
+    1. Write the body (a minimal ``cycling_data_msg`` with
+       ``operate_type = ALL_DEL``) to the third UART RX (``…-7e``).
+    2. Write the 20-byte head (service=CYCLING_DATA, op=ALL_DEL) to
+       the control UART RX (``…-8e``).
+
+    The device replies with a ``ConfirmFrame`` whose status byte at
+    offset 7 is the ``DeviceReturnStatus`` ordinal. The BSC200 may
+    silently keep an activity that's still considered open by the
+    firmware — see PROTOCOL.md §7.5 / §7.4 for the active-file
+    protection pattern. Callers should re-list afterwards.
+    """
+    pb = cycling_data_pb2.cycling_data_msg()
+    pb.service_type = common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA
+    pb.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_ALL_DEL
+    body = pb.SerializeToString()
+    head = _build_cycling_data_head(
+        body,
+        op=cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_ALL_DEL,
+        file_tag=framing.FILE_TAG_DEFAULT,
+    )
+    queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA)
+    try:
+        # Live BSC200 (gen 4, fw 2024-05-14) accepts only the merged
+        # ``(head ‖ body)`` pattern on the third UART here — the
+        # smali's nominal split-write recipe yields ``status=1``
+        # (DataError) instead. Verified by replaying both wire
+        # variants back-to-back via ``tmp/probe_del.py``: merged
+        # acks; split rejects.
+        await client._transport.send(head + body, channel="third")
+        response = await asyncio.wait_for(queue.get(), timeout=timeout)
+    finally:
+        await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA, queue)
+    return int(response.frame.status)
+
+
+def _build_cycling_data_head(body: bytes, *, op: int, file_tag: int) -> bytes:
+    """Build a 20-byte PbFrame head for a CYCLING_DATA service request.
+
+    The captured wire (snoop_start.log frame 35365) and the smali both
+    set the head's operation byte to the protobuf's
+    ``cycling_data_operate_type`` value (not OP_GET = 2). Pass it
+    explicitly here so each caller can name its own op.
+    """
+    size = len(body)
+    h = bytearray(framing.HEADER_SIZE)
+    h[framing.HDR_TYPE] = framing.TYPE_PB
+    h[framing.HDR_SERVICE] = common_pb2.enum_SERVICE_TYPE_INDEX_CYCLING_DATA & 0xFF
+    h[framing.HDR_SUB_SERVICE] = 0xFF
+    h[framing.HDR_FILE_TAG] = file_tag & 0xFF
+    h[framing.HDR_OPERATION] = op & 0xFF
+    h[framing.HDR_SUB_OPERATION] = 0xFF
+    h[framing.HDR_RESERVED_6] = 0xFF
+    h[framing.HDR_PAYLOAD_SIZE] = (size >> 8) & 0xFF
+    h[framing.HDR_PAYLOAD_SIZE + 1] = size & 0xFF
+    h[framing.HDR_PAYLOAD_CRC] = framing.crc8(body)
+    h[framing.HDR_END_MARKER] = framing.TYPE_PB
+    for off in range(11, 19):
+        h[off] = 0xFF
+    h[framing.HDR_HEADER_CRC] = framing.crc8(bytes(h[:19]))
+    return bytes(h)
 
 
 def _truncate_filename(name: str, device_name: str | None) -> str:

@@ -17,9 +17,10 @@ import pytest
 from ligpsport.ble import BleakTransport
 from ligpsport.client import IgpsportClient
 from ligpsport.commands import (
+    ActivityList,
     DeviceStatus,
     DeviceVersion,
-    RideList,
+    DownloadedFile,
     SensorList,
     UserConfig,
     run_named,
@@ -67,7 +68,39 @@ async def test_live_user(client: IgpsportClient) -> None:
 
 async def test_live_rides(client: IgpsportClient) -> None:
     result = await run_named(client, "rides", timeout=10.0)
-    assert isinstance(result.value, RideList)
+    assert isinstance(result.value, ActivityList)
+
+
+async def test_live_list_activities(client: IgpsportClient) -> None:
+    """``list-activities`` succeeds — entries may be empty or non-empty."""
+    result = await run_named(client, "list-activities", timeout=10.0)
+    assert isinstance(result.value, ActivityList)
+
+
+async def test_live_download_activity(client: IgpsportClient, tmp_path) -> None:
+    """If at least one activity is present, downloading it produces FIT bytes.
+
+    Read-only — uses the third UART RX (``…-7e``) + file_tag=0x55
+    transmit-complete path documented in PROTOCOL.md §6.4. Skips if
+    the device has no recorded activities to pull (test harness can't
+    create one on its own).
+    """
+    listing = await run_named(client, "list-activities", timeout=10.0)
+    activities = listing.value
+    assert isinstance(activities, ActivityList)
+    if not activities.files:
+        pytest.skip("BSC200 has no recorded activities to download")
+    target = activities.files[0]
+    out = tmp_path / f"activity_{target.timestamp}.fit"
+    result = await run_named(
+        client,
+        "download-activity",
+        args=(str(target.timestamp), str(out)),
+        timeout=30.0,
+    )
+    assert isinstance(result.value, DownloadedFile)
+    assert result.value.size_bytes == target.file_size
+    assert result.value.fit_magic is True
 
 
 async def test_live_sensors(client: IgpsportClient) -> None:

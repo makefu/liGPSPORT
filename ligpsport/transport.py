@@ -45,22 +45,28 @@ if TYPE_CHECKING:
     from types import TracebackType
 
 
-Channel = Literal["control", "data", "fourth"]
+Channel = Literal["control", "data", "third", "fourth"]
 """Selects which BLE characteristic ``Transport.send`` writes to.
 
 The names mirror the iGPSPORT app's smali (``mControlRxCharacteristic``,
-``mRxCharacteristic``, ``mFourthRxCharacteristic``) and the UUID
-suffixes from :mod:`ligpsport.gatt`:
+``mRxCharacteristic``, ``mThirdRxCharacteristic``,
+``mFourthRxCharacteristic``) and the UUID suffixes from
+:mod:`ligpsport.gatt`:
 
 * ``"control"`` — ``PRIMARY_RX_UUID`` (``…-8e``). All read commands
   and most writes go here.
 * ``"data"`` — ``DATA_RX_UUID`` (``…-9e``). The data-bearing channel
   for generation-1/2 devices' file-upload chunks.
+* ``"third"`` — ``THIRD_RX_UUID`` (``…-7e``). The channel the
+  iGPSPORT app uses for CYCLING_DATA list / download / delete on
+  generation-3+ devices (verified against btsnoop frame 35365 of
+  ``snoop_start.log``: handle ``0x0019`` is the third RX).
 * ``"fourth"`` — ``FOURTH_RX_UUID`` (``…-6e``). The data-bearing
-  channel for generation-3+ devices' file-upload chunks.
+  channel for generation-3+ devices' route-plan / file-operation
+  file uploads.
 """
 
-CHANNELS: Final[tuple[Channel, ...]] = ("control", "data", "fourth")
+CHANNELS: Final[tuple[Channel, ...]] = ("control", "data", "third", "fourth")
 
 
 class TransportClosed(RuntimeError):

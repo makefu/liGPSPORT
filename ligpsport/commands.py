@@ -21,7 +21,6 @@ from typing import Final
 from . import client as _client
 from . import file_transfer
 from .proto import (
-    cycling_data_pb2,
     dev_status_pb2,
     dev_ver_info_pb2,
     factory_pb2,
@@ -271,8 +270,8 @@ class UserConfig:
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
-class RideFile:
-    """One entry in the device's recorded-ride list."""
+class ActivityFile:
+    """One entry in the device's recorded-activity list."""
 
     timestamp: int
     file_size: int
@@ -283,25 +282,47 @@ class RideFile:
         return dataclasses.asdict(self)
 
     def format(self) -> str:
+        import datetime as _dt
+
+        # The device records the timestamp as a uint32 epoch-seconds
+        # value rebased on iGPSPORT's "Garmin epoch" (1989-12-31
+        # 00:00 UTC), the same epoch the embedded FIT file uses. A
+        # naïve ISO render keeps the digits readable in the
+        # activity list without committing to a specific timezone.
+        epoch = _dt.datetime(1989, 12, 31, tzinfo=_dt.UTC)
+        when = epoch + _dt.timedelta(seconds=self.timestamp)
         return (
-            f"timestamp={self.timestamp} size={self.file_size}B "
+            f"timestamp={self.timestamp} ({when.isoformat()}) "
+            f"size={self.file_size}B "
             f"user={self.user_id!r} device={self.device_id!r}"
         )
 
 
-@dataclasses.dataclass(slots=True, frozen=True)
-class RideList:
-    """Wrapper around a list of ride files; provides format() and to_dict()."""
+# Backwards-compatibility alias: ``RideFile`` was the original name
+# before the rename to ``ActivityFile`` (matches the smali's
+# ``HistoryActivity`` / ``readActivityList`` vocabulary). Callers
+# from the previous release still reference ``RideFile`` — keep
+# the alias so existing scripts don't break.
+RideFile = ActivityFile
 
-    files: tuple[RideFile, ...]
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ActivityList:
+    """Wrapper around a list of recorded activities."""
+
+    files: tuple[ActivityFile, ...]
 
     def to_dict(self) -> dict[str, object]:
         return {"files": [f.to_dict() for f in self.files]}
 
     def format(self) -> str:
         if not self.files:
-            return "no recorded rides on device"
+            return "no recorded activities on device"
         return "\n".join(f.format() for f in self.files)
+
+
+# Same compatibility alias as above for the wrapper class.
+RideList = ActivityList
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -649,23 +670,29 @@ async def _r_rides(
     client: _client.IgpsportClient,
     _args: Sequence[str],
     timeout: float,
-) -> RideList:
-    request = cycling_data_pb2.cycling_data_msg()
-    request.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_LIST_GET
-    response = await client.request(request, timeout=timeout)
-    msg = response.message
-    if not isinstance(msg, cycling_data_pb2.cycling_data_msg):
-        raise CommandError(f"unexpected response message: {type(msg).__name__}")
+) -> ActivityList:
+    """List recorded activities on the device.
+
+    Wraps :func:`file_transfer.list_activities`, which sends
+    ``CYCLING_DATA LIST_GET`` on the **third UART RX** (``…-7e``) —
+    that's the channel the iGPSPORT app uses (verified against
+    btsnoop frame 35365 of ``snoop_start.log``). The earlier
+    implementation sent the request on the control channel and
+    happened to get a reply on the BSC200, but the third-channel
+    path matches what the firmware actually expects and is what
+    every other activity op (FILE_GET, FILE_DEL) needs anyway.
+    """
+    entries = await file_transfer.list_activities(client, timeout=timeout)
     files = tuple(
-        RideFile(
-            timestamp=f.timestamp,
-            file_size=f.file_size,
-            user_id=f.user_id,
-            device_id=f.device_id,
+        ActivityFile(
+            timestamp=e.timestamp,
+            file_size=e.file_size,
+            user_id=e.user_id,
+            device_id=e.device_id,
         )
-        for f in msg.cycling_data_file_flag_msg
+        for e in entries
     )
-    return RideList(files=files)
+    return ActivityList(files=files)
 
 
 async def _r_sensors(
@@ -968,29 +995,72 @@ async def _r_set_user(
     return f"updated user profile ({len(parsed)} field{'s' if len(parsed) != 1 else ''})"
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class DelActivityResult:
+    """Outcome of the ``del-activity`` / ``delete-ride`` command.
+
+    *deleted* is True iff a follow-up ``LIST_GET`` confirms the
+    activity is gone. *not_found* distinguishes "the device never
+    had this timestamp" from "firmware refused / silently kept it".
+    """
+
+    timestamp: int
+    deleted: bool
+    not_found: bool
+    device_status: int
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    def format(self) -> str:
+        if self.not_found:
+            return f"No activity with timestamp={self.timestamp} on device"
+        if self.deleted:
+            return f"Deleted activity timestamp={self.timestamp}"
+        return (
+            f"Delete failed: activity timestamp={self.timestamp} still "
+            f"present (device status={self.device_status})"
+        )
+
+
 async def _r_delete_ride(
     _spec: CommandSpec,
     client: _client.IgpsportClient,
     args: Sequence[str],
     timeout: float,
-) -> str:
-    """Delete one recorded ride file from the device. **Destructive.**"""
+) -> DelActivityResult:
+    """Delete one recorded activity from the device. **Destructive.**
+
+    Pre-checks the list to distinguish "not on device" from
+    "deletion refused", issues
+    :func:`file_transfer.delete_activity` (gen-4 merged write on
+    the fourth UART with op=FILE_DEL), then re-lists to confirm
+    the activity is gone.
+    """
     if not args:
-        raise CommandError("delete-ride takes <timestamp>")
+        raise CommandError("delete-ride / del-activity takes <timestamp>")
     try:
         timestamp = int(args[0])
     except ValueError as exc:
         raise CommandError(f"invalid timestamp: {args[0]!r}") from exc
-    request = cycling_data_pb2.cycling_data_msg()
-    request.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_DEL
-    f = request.cycling_data_file_flag_msg.add()
-    f.timestamp = timestamp
-    await client.request(
-        request,
-        operation=cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_FILE_DEL,
-        timeout=timeout,
+
+    pre = await file_transfer.list_activities(client, timeout=timeout)
+    if not any(e.timestamp == timestamp for e in pre):
+        return DelActivityResult(
+            timestamp=timestamp,
+            deleted=False,
+            not_found=True,
+            device_status=0,
+        )
+    status = await file_transfer.delete_activity(client, timestamp, timeout=timeout)
+    post = await file_transfer.list_activities(client, timeout=timeout)
+    still_present = any(e.timestamp == timestamp for e in post)
+    return DelActivityResult(
+        timestamp=timestamp,
+        deleted=not still_present,
+        not_found=False,
+        device_status=status,
     )
-    return f"requested delete of ride file timestamp={timestamp}"
 
 
 async def _r_delete_all_rides(
@@ -999,15 +1069,16 @@ async def _r_delete_all_rides(
     _args: Sequence[str],
     timeout: float,
 ) -> str:
-    """Delete every recorded ride on the device. **Very destructive.**"""
-    request = cycling_data_pb2.cycling_data_msg()
-    request.cycling_data_operate_type = cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_ALL_DEL
-    await client.request(
-        request,
-        operation=cycling_data_pb2.enum_CYCLING_DATA_OPERATE_TYPE_ALL_DEL,
-        timeout=timeout,
-    )
-    return "requested delete-all-rides"
+    """Delete every recorded activity on the device. **Very destructive.**
+
+    Uses the third UART RX (``…-7e``) and the standard CYCLING_DATA
+    head — same wire path as :func:`file_transfer.delete_activity`
+    but with op = ``ALL_DEL`` (6). The BSC200 may silently keep an
+    activity that's still considered active by the firmware; the
+    caller should re-list to verify.
+    """
+    status = await file_transfer.delete_all_activities(client, timeout=timeout)
+    return f"delete-all-rides ack status={status}"
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -1174,6 +1245,15 @@ async def _r_get_ride(
     args: Sequence[str],
     timeout: float,
 ) -> DownloadedFile:
+    """Download a recorded activity by timestamp.
+
+    Same as the new ``download-activity`` command; kept under the
+    older ``get-ride`` name for backwards compatibility. The
+    optional third positional argument used to be ``expected_size``
+    (kept tolerated for old scripts but no longer needed — the
+    BSC200's embedded ``file_download`` protobuf carries the
+    authoritative file size).
+    """
     if len(args) < 2:
         raise CommandError("get-ride takes <timestamp> <out-path>")
     try:
@@ -1181,19 +1261,20 @@ async def _r_get_ride(
     except ValueError as exc:
         raise CommandError(f"invalid timestamp: {args[0]!r}") from exc
     out_path = args[1]
-    expected_size: int | None = None
     if len(args) >= 3:
+        # Tolerate the legacy expected_size positional argument; the
+        # transmit-complete framing path derives the authoritative
+        # size from the device's reply and no longer needs a hint.
         try:
-            expected_size = int(args[2])
+            int(args[2])
         except ValueError as exc:
             raise CommandError(f"invalid expected_size: {args[2]!r}") from exc
-    data = await file_transfer.download_cycling_data(
+    activity = await file_transfer.download_activity(
         client,
         timestamp=timestamp,
-        expected_size=expected_size,
-        chunk_timeout=timeout,
-        overall_timeout=max(60.0, timeout * 6),
+        timeout=max(60.0, timeout * 6),
     )
+    data = activity.content
     with open(out_path, "wb") as fh:
         fh.write(data)
     # FIT files start with the local header pattern: byte 0 = header size
@@ -1279,7 +1360,18 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
     ),
     "rides": CommandSpec(
         name="rides",
-        description="List recorded ride files on the device.",
+        description="List recorded activities on the device (alias of list-activities).",
+        runner=_r_rides,
+    ),
+    "list-activities": CommandSpec(
+        name="list-activities",
+        description=(
+            "List recorded activities on the device. Each entry "
+            "carries a unix-ish timestamp (the FIT file's start time "
+            "on the device's local clock), size in bytes, user_id "
+            "and device_id. The timestamp doubles as the file id "
+            "for download-activity / del-activity."
+        ),
         runner=_r_rides,
     ),
     "sensors": CommandSpec(
@@ -1309,7 +1401,20 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
     ),
     "get-ride": CommandSpec(
         name="get-ride",
-        description="Download a recorded ride file by timestamp: get-ride <ts> <out> [size]",
+        description=(
+            "Download a recorded activity by timestamp (alias of "
+            "download-activity): get-ride <ts> <out> [size]"
+        ),
+        runner=_r_get_ride,
+    ),
+    "download-activity": CommandSpec(
+        name="download-activity",
+        description=(
+            "Download a recorded activity file by timestamp. Writes "
+            "the FIT bytes to <out-path>. Syntax: download-activity "
+            "<timestamp> <out-path>. Timestamps come from "
+            "list-activities / rides."
+        ),
         runner=_r_get_ride,
     ),
     "upload-route": CommandSpec(
@@ -1335,10 +1440,24 @@ COMMANDS: Final[Mapping[str, CommandSpec]] = {
     ),
     "delete-ride": CommandSpec(
         name="delete-ride",
-        description="Delete one ride file by timestamp.",
+        description="Delete one recorded activity by timestamp (alias of del-activity).",
         runner=_r_delete_ride,
         destructive=True,
-        danger="Irreversibly deletes the ride file from the device's flash.",
+        danger="Irreversibly deletes the activity from the device's flash.",
+    ),
+    "del-activity": CommandSpec(
+        name="del-activity",
+        description=(
+            "Delete one recorded activity from the device by "
+            "timestamp (`del-activity <timestamp>`; timestamps come "
+            "from list-activities / rides). Pre-checks the list to "
+            "distinguish 'not on device' from 'firmware kept it', "
+            "then re-lists to confirm the delete actually took. "
+            "Destructive."
+        ),
+        runner=_r_delete_ride,
+        destructive=True,
+        danger="Permanently deletes a recorded activity from the device.",
     ),
     "delete-all-rides": CommandSpec(
         name="delete-all-rides",

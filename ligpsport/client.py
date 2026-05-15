@@ -24,7 +24,7 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Final
 
-from google.protobuf.message import Message
+from google.protobuf.message import DecodeError, Message
 
 from . import envelope, framing
 from .transport import Transport, TransportClosed
@@ -204,11 +204,33 @@ class IgpsportClient:
         except framing.FrameError:
             _LOG.warning("dropping malformed frame: %d bytes", len(raw))
             return
-        try:
-            message = envelope.decode_payload(frame.service, frame.payload)
-        except envelope.UnknownServiceError:
-            _LOG.warning("dropping frame for unknown service=%d", frame.service)
-            return
+        if frame.file_tag == framing.FILE_TAG_TRANSMIT_COMPLETE:
+            # Transmit-complete download stream (file_tag=0x55). The
+            # payload is *not* a protobuf — it's
+            # ``[4B pb_size, file_download protobuf, raw file
+            # bytes]`` (PROTOCOL.md §6.4). The framing layer already
+            # extracted the full payload via
+            # :func:`transmit_complete_total_size`. Pass it through
+            # without protobuf decoding; consumers (e.g.
+            # :func:`file_transfer.download_activity`) split it
+            # themselves.
+            try:
+                message_cls = envelope.message_class_for(frame.service)
+            except envelope.UnknownServiceError:
+                _LOG.warning(
+                    "dropping transmit-complete frame for unknown service=%d", frame.service
+                )
+                return
+            message = message_cls()
+        else:
+            try:
+                message = envelope.decode_payload(frame.service, frame.payload)
+            except envelope.UnknownServiceError:
+                _LOG.warning("dropping frame for unknown service=%d", frame.service)
+                return
+            except DecodeError:
+                _LOG.warning("dropping frame for service=%d: protobuf decode failed", frame.service)
+                return
         response = Response(frame=frame, message=message)
         async with self._lock:
             queue = self._pending.get(frame.service)

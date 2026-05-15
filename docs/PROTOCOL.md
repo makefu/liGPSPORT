@@ -38,9 +38,18 @@ the control channel's TX. The library subscribes to TX on all four
 channels and reassembles by header — the reassembly buffer is
 per-frame, not per-channel.
 
-The third and fourth channels (`7e`, `6e`) are reserved for parallel
-file / firmware streams on newer iGS models; the BSC200 advertises
-them but doesn't drive traffic over them.
+The third channel (`7e`) carries the CYCLING_DATA service's
+list / download / delete traffic on gen-3+ devices (see §6.4 and
+§7.5) — the iGPSPORT app's
+``IGPDeviceManager.{readActivityList,readActivityFitFile,
+deleteActivityFitFile}`` push onto ``thirdQueue`` for
+``IGPDevice.getGeneration() >= 3``, which corresponds to the
+``…-7e`` characteristic. The library exposes this as
+``Channel = "third"`` in :mod:`ligpsport.transport`.
+
+The fourth channel (`6e`) carries the FILE_OPERATION ADD upload
+stream (route plans, CNX bytes — §7.1.2) and the gen-4 merged-write
+variants of ROUTE_PLAN FILE_USE / FILES_DEL (§7.2 / §7.4).
 
 ### Advertising
 
@@ -96,13 +105,13 @@ and `BaseHead20Bytes$Companion#updateCRC` in
 | 0      | u8    | `first_command`   | 0x01    | `END_TYPE_PB` constant — every frame begins with 0x01.          |
 | 1      | u8    | `service`         | (set)   | Index into `common.proto`'s `service_type_index` enum (0..23). |
 | 2      | u8    | `sub_service`     | 0xFF    | Second-tier service byte; used by peripheral protocols.         |
-| 3      | u8    | `file_tag`        | 0xFF    | Multipart file-transfer tag; set via `setSendFileTag`.          |
+| 3      | u8    | `file_tag`        | 0xFF    | Multipart file-transfer tag; see [`file_tag` values](#file-tag-magic). |
 | 4      | u8    | `operation`       | 0xFF    | Main operate-type (per-service enum, e.g. `SET=1`, `GET=2`).    |
 | 5      | u8    | `sub_operation`   | 0xFF    | Second-tier operate-type.                                       |
 | 6      | u8    | reserved          | 0xFF    | Hard-coded `-1` in the Kotlin source.                            |
 | 7-8    | u16   | `payload_size`    | (set)   | **Big-endian**; produced by `StringUtils.unsignedShortToByte2`. |
 | 9      | u8    | `payload_crc`     | (set)   | CRC8 of payload bytes only.                                     |
-| 10     | u8    | `end_marker`      | 0x01    | `END_TYPE_PB` constant; literal 1 in the Kotlin source.         |
+| 10     | u8    | `end_marker`      | 0x01    | `END_TYPE_PB` (0x01) for ordinary frames; `0x02` = "continue" and `0x03` = "last chunk" for chunked file streams (FILE_SEND uploads, FILE_GET downloads). |
 | 11-18  | 8×u8  | reserved padding  | 0xFF    | `RESERVED_BYTE_SIZE = 8` filled by a tight `0xFF` loop.          |
 | 19     | u8    | `header_crc`      | (set)   | CRC8 of bytes 0..18 (added by `Companion.updateCRC`).           |
 
@@ -118,6 +127,14 @@ shipped in `ligpsport/framing.py` as `_CRC8_TABLE`. The
 `com.igpsport.blelib.utils.CRC8#calcCrc8` algorithm is a plain
 table-driven loop with no special init or post-processing — the
 Python `framing.crc8` function matches byte for byte.
+
+<a id="file-tag-magic"></a>**`file_tag` values (offset 3):**
+
+| Value | Name (`framing.FILE_TAG_*`)    | Meaning                                                                         |
+|-------|--------------------------------|----------------------------------------------------------------------------------|
+| `0xFF` | `DEFAULT`                      | No chunked-file bookkeeping (the common case for read/write commands).           |
+| `0xAA` | `FILE_OPERATION_UPLOAD`        | App→device chunked file upload via FILE_OPERATION ADD (§7.1.2). Set by `sendRoutePlanFileSingleChannel`.|
+| `0x55` | `TRANSMIT_COMPLETE`            | Device→app multi-burst file download (`TransmitCompleteCommand` in the smali). Used by CYCLING_DATA FILE_GET responses (§7.5); the head's `payload_size` is *not* authoritative — the real length comes from an embedded `file_download` protobuf. |
 
 ### 2.3 Fragmentation
 
@@ -250,17 +267,67 @@ service follows the same wire shape:
   age, height, wheel diameter, bike weight, time zone, member id).
 * **`SET=1`** with `user_config_data_message` overwrites the profile.
 
-### 6.4 CYCLING_DATA (service 6)
+### 6.4 CYCLING_DATA (service 6) — recorded activities
+
+The BSC200 calls a recorded ride an **Activity** (the Android app's
+vocabulary is consistent: ``HistoryActivity``,
+``readActivityList``, ``readActivityFitFile``,
+``deleteActivityFitFile``). Every activity is stored on the device
+as a Garmin **FIT** file keyed by a uint32 *timestamp* — that value
+is both the file's filesystem key and the unique handle for every
+op below. PROTOCOL.md §7.5 has the wire-level capture details and
+the full library binding; this section documents the operation set.
 
 * **`LIST_GET=1`** → **`LIST_SEND=2`** with one
-  `cycling_data_file_flag_message` per recorded ride
-  (`timestamp`, `file_size`, `user_id`, `device_id`).
-* **`FILE_GET=3`** identifying the file by timestamp → device streams
-  one or more **`FILE_SEND=4`** chunks whose `file_content` field
-  contains the FIT bytes. Each chunk uses an incrementing `file_tag`
-  byte in the 20-byte header (see §2.1).
-* **`FILE_DEL=5`** with a `cycling_data_file_flag_message` — destructive.
-* **`ALL_DEL=6`** — wipes all recorded rides — destructive.
+  `cycling_data_file_flag_message` per recorded activity
+  (`timestamp`, `file_size`, `user_id`, `device_id`). The request
+  carries a ``file_list_get_message`` range
+  (``file_index_start`` / ``file_index_end``). The BSC200
+  firmware pads the reply with zero entries
+  (``timestamp=0, file_size=0``) up to ``file_list_support_num_max``
+  (= 20 on current firmware); the library's
+  :func:`file_transfer.list_activities` strips them so callers see
+  real entries only.
+* **`LIST_NUM_GET=8`** → **`LIST_SEND=2`** with a populated
+  ``file_list_get_message`` (``file_num``,
+  ``file_list_support_num_max``). Used by the iGPSPORT app to
+  decide pagination — captured live in
+  ``snoop_start.log`` frame 35365.
+* **`FILE_GET=3`** identifying the file by ``timestamp`` → device
+  streams a single **transmit-complete** PbFrame on the third TX
+  (``…-7e``). The 20-byte head carries ``file_tag = 0x55``,
+  ``operation = FILE_SEND (4)`` and ``end_marker = 0x03``; its
+  ``payload_size`` field is **deliberately bogus** on the BSC200
+  (the firmware writes ``0x07A7`` / 1959 regardless of the
+  actual stream length). The actual length is the size of an
+  embedded ``file_download`` protobuf: the first 4 payload bytes
+  are a big-endian ``pb_size``; the next ``pb_size`` bytes are a
+  ``file_download`` protobuf carrying the authoritative
+  ``file_size``; then ``file_size`` raw bytes of FIT file content.
+  Total stream = ``20 + 4 + pb_size + file_size`` bytes. See
+  §7.5 for the byte-level layout and the reassembly logic.
+* **`FILE_DEL=5`** with a ``cycling_data_file_flag_message``
+  carrying ``timestamp`` → device replies with a 20-byte
+  ``ConfirmFrame`` on CYCLING_DATA / FILE_DEL whose status byte
+  is the ``DeviceReturnStatus`` ordinal (0 = success). Destructive.
+* **`ALL_DEL=6`** — wipes every recorded activity — destructive.
+* **`AUTO_UPLOAD=7`** is not an upload over BLE — it stores a
+  ``cycling_data_auto_upload_message`` carrying the URL the
+  device should auto-upload to over **WiFi** once it has
+  connected. Configures the device's cloud-upload backend; does
+  not transfer file bytes over the BLE link.
+
+There is **no app→device "upload activity"** path in the
+protocol. The CYCLING_DATA service has no inverse of FILE_GET;
+``FILE_SEND`` is strictly device→app. The iGPSPORT Android app
+mirrors this in code — the only ``readActivityFitFile`` /
+``deleteActivityFitFile`` methods exist; there is no
+``writeActivityFitFile`` or ``sendActivityFitFile`` in
+``IGPDeviceManager``. The cloud-side upload (the
+``uploadActivityByOss`` call in ``NewApiService``) is an HTTP
+upload from the phone to iGPSPORT's OSS bucket *after* the FIT
+file has been pulled off the device via FILE_GET; the device
+itself only ever emits activity files, never accepts them.
 
 ### 6.5 SENSOR (service 14)
 
@@ -912,6 +979,227 @@ gen ≤ 3 devices take body-on-data + header-on-control.
   underlying helper used by ``del-route`` and available to
   scripts that need to delete multiple routes in one shot.
 
+### 7.5 Listing, downloading, and deleting activities
+
+The BSC200 keeps recorded rides as Garmin **FIT** files in flash
+under the **CYCLING_DATA** service (§6.4). The iGPSPORT app
+exposes them as *Activities*; the library matches that vocabulary
+(``list-activities`` / ``download-activity`` / ``del-activity``,
+with the older ``rides`` / ``get-ride`` / ``delete-ride`` names
+preserved as aliases). All three operations share two non-obvious
+wire details that differ from the documented enums and from
+ROUTE_PLAN's chunked uploads:
+
+1. **They run on the third UART RX (``…-7e``), not the control
+   UART** the rest of the library uses. The iGPSPORT app's
+   ``IGPDeviceManager.readActivityList`` /
+   ``readActivityFitFile`` / ``deleteActivityFitFile`` all push
+   onto ``thirdQueue`` for ``IGPDevice.getGeneration() >= 3``
+   (the BSC200 reports gen 4). The btsnoop capture in
+   ``snoop_start.log`` frame 35365 confirms it: the LIST_NUM_GET
+   request hits handle ``0x0019`` — the third RX (``…-7e``) —
+   and the reply notification arrives on handle ``0x001b``, the
+   matching third TX.
+2. **FILE_GET requests set ``file_tag = 0x55`` in the 20-byte
+   head.** The smali ``readActivityFitFile`` (c4 line ~1442 for
+   gen 4) wraps the freshly-built head in a
+   ``TransmitCompleteCommand`` and patches byte 3 (the
+   ``file_tag`` slot) to 0x55. Without that magic the BSC200
+   silently ignores the request — verified live against firmware
+   2024-05-14: every variant we tried with ``file_tag = 0xFF``
+   (default), regardless of channel or operation byte, timed
+   out with no reply. With ``file_tag = 0x55`` on the third RX
+   the device streams the file.
+
+#### Listing — LIST_GET (op 1) and LIST_NUM_GET (op 8)
+
+Wire shape (captured frame 35365, anonymised
+``docs/btsnoop_hci.log``):
+
+```
+write handle=0x0019 (third RX, …-7e), 24 bytes:
+  20-byte head:
+    01 06 ff ff 08 ff ff 00 04 e3 01 ff*8 0b
+    │  │     │  │              │  │  │
+    │  │     │  │              │  │  └── header CRC8(bytes 0..18)
+    │  │     │  │              │  └───── END_TYPE_PB
+    │  │     │  │              └──────── payload CRC8(body)
+    │  │     │  │ ^^^^^ BE16 payload_size = 4
+    │  │     │  └─ operation = LIST_NUM_GET (8)
+    │  │     └─── file_tag = 0xff (no transmit-complete magic)
+    │  └─ service = CYCLING_DATA (6)
+    └──── TYPE_PB
+  4-byte body: cycling_data_msg{service_type=6, op=8}
+```
+
+Notification on handle ``0x001b`` (third TX, ``…-7e``):
+
+```
+01 06 ff ff 08 ff ff 00 0a e0 01 ff*8 72
+   |              |
+   └─ op=LIST_NUM_GET                                    │
+                                            │
+   <10-byte body: file_list_get_msg{file_num=0, file_list_support_num_max=20}>
+```
+
+The library's :func:`ligpsport.file_transfer.list_activities`
+sends a full ``LIST_GET`` (op 1) with an inclusive index range
+``[0, 100]`` — same idiom as ``ROUTE_PLAN LIST_GET``. The
+device populates the reply with every entry plus
+``file_list_support_num_max - file_num`` zero-padded
+placeholders; the helper strips the padders before returning.
+
+#### Downloading — FILE_GET (op 3), transmit-complete stream
+
+Request (live, ``timestamp = 1147795610``, file size 15572):
+
+```
+write on third RX (…-7e), 32 bytes:
+  20-byte head:
+    01 06 ff 55 03 ff ff 00 0c 6b 01 ff*8 29
+    │     │  │  │                       │
+    │     │  │  └─ operation = FILE_GET (3)
+    │     │  └──── file_tag = 0x55 (TransmitCompleteCommand)
+    │     └─────── service = CYCLING_DATA (6)
+    └──────────── TYPE_PB
+  12-byte body: cycling_data_msg{op=FILE_GET,
+                  cycling_data_file_flag_msg=[{timestamp=1147795610}]}
+```
+
+Reply (live, captured byte-for-byte in
+``tmp/snoop_dl/activity_third.fit``):
+
+```
+notification on third TX (…-7e), 20 + 4 + pb_size + file_size bytes
+total (= 15639 bytes for a 15572-byte FIT):
+
+  20-byte head:
+    01 06 ff 55 04 ff ff 07 a7 00 03 ff*8 22
+    │           │     │  │              │
+    │           │     │  └─ end_marker = 0x03 (LAST)
+    │           │     └──── payload_crc = 0x00  ← zeroed; BSC200 quirk
+    │           │   ^^ payload_size = 0x07a7 (1959) — DELIBERATELY BOGUS
+    │           └─ operation = FILE_SEND (4)
+    │     └─────── file_tag echoed back: 0x55
+    └──────────── TYPE_PB
+
+  4-byte BE u32: pb_size  (= 3 for this file)
+  pb_size bytes: file_download protobuf, e.g. `08 d4 79`
+                 = {file_size = 15572}
+  file_size bytes: raw FIT bytes (start with `.FIT` magic at
+                 offset 8 of the FIT header)
+```
+
+Several BSC200-firmware quirks worth flagging up front:
+
+* **`payload_size` (offsets 7-8) is not the stream length.** The
+  firmware writes ``0x07A7`` (1959) regardless of how much data
+  follows. The library's framing layer detects ``file_tag = 0x55``
+  via :func:`framing.is_transmit_complete_head` and switches
+  to a length-from-pbInfo path
+  (:func:`framing.transmit_complete_total_size`) instead of
+  trusting the head.
+* **`payload_crc` (offset 9) is zero.** The
+  :func:`framing._parse_pb_frame` validator tolerates a zero
+  payload CRC byte specifically for transmit-complete frames.
+* **No EOS marker.** The library learns when the stream is
+  complete by counting bytes: ``4 + pb_size + file_size``. A
+  trailing BACK / WiFi service request (``TYPE_REQUEST`` /
+  type=0x03) frame is unrelated periodic device chatter and is
+  routed normally through the dispatcher.
+* **The `cycling_data_msg` envelope is bypassed.** The payload is
+  **not** a protobuf — it's the `[4B size][pbInfo][file bytes]`
+  blob above. The client dispatcher in
+  :class:`ligpsport.client.IgpsportClient` recognises
+  ``file_tag = 0x55`` frames and skips the
+  :func:`envelope.decode_payload` call so the raw bytes flow
+  through unchanged.
+
+#### Deleting — FILE_DEL (op 5) and ALL_DEL (op 6)
+
+Wire shape (verified end-to-end against the in-tree simulator and
+against a live BSC200, firmware 2024-05-14):
+
+```
+write on third RX (…-7e), 30 bytes:
+  20-byte head:
+    01 06 ff ff 05 ff ff 00 0a <crc> 01 ff*8 <hdr-crc>
+    │           │
+    │           └─ operation = FILE_DEL (5)  | ALL_DEL = 6
+    └─ service = CYCLING_DATA (6)
+  10-byte body: cycling_data_msg{op=FILE_DEL,
+                  cycling_data_file_flag_msg=[{timestamp=<ts>}]}
+```
+
+Reply (TYPE_CONFIRM frame on third TX):
+
+```
+02 06 ff ff <op> ff ff <status> ff*11 <crc>
+                       ^^^^^^^^ DeviceReturnStatus wire byte
+```
+
+Both FILE_DEL and ALL_DEL go out on the third UART RX as a single
+**merged** ``(head ‖ body)`` write — same wire pattern the smali
+calls ``byteMerger(pair.second, pair.first)``. Worth noting: the
+Android app's smali ``deleteAllActivityFitFile`` (line 6742+)
+doesn't actually call ``byteMerger`` for ALL_DEL — it passes
+``sendData=body, confirmData=header`` and relies on the gen-4
+``send$lambda-135`` to *skip* the follow-up control-channel
+header write, with the result that on gen-4 only the body would
+land at the device. Empirically the BSC200 rejects that
+(``status=1`` DataError) and accepts the merged write happily;
+the iGPSPORT app's gen-4 behaviour here is a latent bug, not the
+protocol's intent. Live-verified: a single merged write returns
+``status=0`` and the activity list goes empty.
+
+##### Active-file protection (FILE_DEL only)
+
+The BSC200 firmware mirrors the **active-route protection** seen
+in ROUTE_PLAN (§7.4) but for activities: a ``FILE_DEL`` request
+targeting an activity the firmware still considers "open" or
+"in progress" returns ``status=0`` (ack) — and silently keeps
+the file. Live-verified: an attempt at FILE_DEL on a freshly
+recorded activity (timestamp from earlier the same day) returned
+``status=0`` but a follow-up ``LIST_GET`` showed the entry still
+present. ``ALL_DEL`` on the same file bypassed the protection
+and cleared the list.
+
+| Op | Same activity | Wire status | Effect on device |
+|----|----------------|-------------|------------------|
+| ``FILE_DEL`` (5) | freshly recorded | ``0`` (ok) | None — silently kept |
+| ``ALL_DEL`` (6) | freshly recorded | ``0`` (ok) | Removed from LIST_GET |
+
+The library's :func:`file_transfer.delete_activity` returns the
+status byte directly; ``0`` is success on the wire but does not
+guarantee deletion. The CLI's ``del-activity`` wraps it with a
+pre/post ``LIST_GET`` so the
+:class:`commands.DelActivityResult` can report honestly whether
+the entry actually disappeared. Callers that need a hard
+guarantee should fall back to
+:func:`file_transfer.delete_all_activities` when ``delete_activity``
+acks ``status=0`` but the entry survives.
+
+#### No upload — by design
+
+The CYCLING_DATA service has no app→device file-write
+operation. The enum's ``FILE_SEND = 4`` is strictly
+device→app (the device streams its own FIT files in response to
+FILE_GET; there is no symmetrical app→device variant). The
+iGPSPORT Android app mirrors this in code: there is no
+``writeActivityFitFile`` / ``sendActivityFitFile`` /
+``uploadActivityFitFile`` method anywhere in
+``IGPDeviceManager``. The cloud-side ``uploadActivityByOss`` in
+``NewApiService`` runs after FILE_GET — the phone pulls the FIT
+off the device, then HTTP-uploads it to iGPSPORT's OSS bucket;
+the device itself only ever emits activity bytes. The
+``AUTO_UPLOAD = 7`` op configures the device's *own* WiFi auto-
+upload URL; it does not transfer file bytes over BLE.
+
+If a future firmware ever exposes an app→device write path it
+would surface in this repo by adding a new op to
+``cycling_data.proto`` and a matching method on
+``IGPDeviceManager`` — neither exists today.
+
 ## 8. Destructive operations
 
 The following ``(service, operation)`` tuples alter persistent state
@@ -921,8 +1209,8 @@ on the device. They are listed verbatim in
 
 | Service | Operation | Effect                                                |
 |---------|-----------|-------------------------------------------------------|
-| 6 (CYCLING_DATA) | 5 (FILE_DEL) | Permanently deletes one recorded ride file.   |
-| 6 (CYCLING_DATA) | 6 (ALL_DEL)  | Permanently deletes every recorded ride.       |
+| 6 (CYCLING_DATA) | 5 (FILE_DEL) | Permanently deletes one recorded activity (§7.5). |
+| 6 (CYCLING_DATA) | 6 (ALL_DEL)  | Permanently deletes every recorded activity.   |
 | 7 (ROUTE_PLAN)   | 3 (FILE_DEL) | Deletes one route plan from the device.        |
 | 7 (ROUTE_PLAN)   | 6 (FILES_DEL)| Deletes multiple route plans in one shot.      |
 | 4 (FIRMWARE)     | 3 (MCU_UPDATE) | Initiates an MCU firmware flash.            |
@@ -980,9 +1268,13 @@ pair and persist it; subsequent connects reuse it.
 
 * The BSC200 advertises all four UART services (`6e` / `7e` / `8e` /
   `9e`) but only exchanges control protocol on `8e` (RX) ↔ `9e` (TX).
-  Whether the third/fourth channels (`7e`, `6e`) become active for
-  parallel firmware/file streams on this device's firmware is unknown
-  — capture needed during a firmware-upgrade flow.
+  The third (`7e`) and fourth (`6e`) channels are both active on
+  this firmware: the third UART carries the CYCLING_DATA activity
+  ops (LIST_GET, FILE_GET, FILE_DEL — see §7.5), and the fourth
+  UART carries FILE_OPERATION uploads and the gen-4 merged
+  ROUTE_PLAN writes (§7.1.2, §7.2). What's *still* unknown is
+  whether either channel becomes active during a firmware-upgrade
+  flow — capture needed.
 * The BSC200's `WIFI` (service 5), `ROUTE_BOOK` (service 23), and
   `IND` (service 1, smart notifications) all time out on this firmware
   (`May 14 2024 11:07:51`, `protocol_ver=101`). The library implements

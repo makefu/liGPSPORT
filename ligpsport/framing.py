@@ -96,6 +96,121 @@ TYPE_REQUEST: Final[int] = 0x03  # Device-initiated request (same byte layout as
 # transcripts read naturally.
 END_TYPE_PB: Final[int] = TYPE_PB
 
+# Chunked-file end markers at offset 10. The default 0x01 is the
+# ordinary request/response sentinel; the chunked file paths
+# (ROUTE_PLAN FILE_SEND uploads, CYCLING_DATA FILE_GET responses)
+# use 0x02 for "more chunks coming" and 0x03 for "this is the last".
+# Mirrors ``sendRoutePlanFile`` smali line 24846-24851 and the
+# captured BSC200 FILE_GET reply head (file_tag=0x55, end=0x03).
+_END_MARKER_CONTINUE: Final[int] = 0x02
+_END_MARKER_LAST: Final[int] = 0x03
+
+# file_tag byte at offset 3. The default 0xFF marks "no chunked
+# bookkeeping"; 0xAA marks the FILE_OPERATION ADD upload stream
+# (see PROTOCOL.md §7.1.2); 0x55 marks a "transmit-complete"
+# style multi-burst download stream — the BSC200 uses it for
+# CYCLING_DATA FILE_GET responses (PROTOCOL.md §6.4 / §7.5).
+# The 0x55 magic comes from ``TransmitCompleteCommand`` in the
+# smali (see ``IGPDeviceManager.readActivityFitFile``) — the
+# request side sets it, and the device echoes it back in the
+# reply head's file_tag.
+FILE_TAG_DEFAULT: Final[int] = 0xFF
+FILE_TAG_FILE_OPERATION_UPLOAD: Final[int] = 0xAA
+FILE_TAG_TRANSMIT_COMPLETE: Final[int] = 0x55
+
+
+def _parse_pb_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    """Read one protobuf varint at *pos*; return ``(value, next_pos)``."""
+    value = 0
+    shift = 0
+    while pos < len(buf):
+        b = buf[pos]
+        pos += 1
+        value |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            return value, pos
+        shift += 7
+        if shift > 63:
+            raise FrameError("varint overflow")
+    raise FrameError("varint truncated")
+
+
+def parse_file_download_size(pb_bytes: bytes) -> int:
+    """Hand-decode ``file_download.proto`` field 1 (``file_size``).
+
+    Used by the BLE reassembly path so the framing layer can determine
+    the actual payload length for a ``file_tag=0x55`` (transmit-complete)
+    download stream without depending on the generated protobuf
+    module — that keeps the dependency direction clean and lets the
+    reassembler call this from any thread/context. Mirrors
+    ``FileCommand.getFileInfoAndFilePair`` in the smali, which reads
+    the same protobuf to learn the stream length.
+    """
+    pos = 0
+    while pos < len(pb_bytes):
+        tag, pos = _parse_pb_varint(pb_bytes, pos)
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+        if wire_type == 0:
+            value, pos = _parse_pb_varint(pb_bytes, pos)
+            if field_num == 1:
+                return value
+        elif wire_type == 2:
+            length, pos = _parse_pb_varint(pb_bytes, pos)
+            pos += length
+        elif wire_type == 1:
+            pos += 8
+        elif wire_type == 5:
+            pos += 4
+        else:
+            raise FrameError(f"unsupported wire_type {wire_type}")
+    raise FrameError("file_download protobuf does not carry file_size (field 1)")
+
+
+def is_transmit_complete_head(header: bytes) -> bool:
+    """True if *header* (20 bytes) is a transmit-complete download head.
+
+    The BSC200 marks a chunked CYCLING_DATA FILE_GET reply with
+    ``file_tag = 0x55`` (smali ``TransmitCompleteCommand``). When set,
+    the head's ``payload_size`` field is *not* authoritative — the
+    actual stream length is ``4 + pb_size + file_size`` bytes (a 4-byte
+    big-endian ``pb_size``, a ``file_download`` protobuf of that
+    length, then ``file_size`` bytes of raw file content). The
+    reassembly path uses this predicate to switch from the standard
+    fixed-size frame model to the streaming model.
+    """
+    return (
+        len(header) >= HEADER_SIZE
+        and header[HDR_TYPE] == TYPE_PB
+        and header[HDR_FILE_TAG] == FILE_TAG_TRANSMIT_COMPLETE
+    )
+
+
+def transmit_complete_total_size(buf: bytes) -> int | None:
+    """Return the full transmit-complete frame size, or ``None`` if buf is too short.
+
+    Layout (mirror of ``FileCommand.getFileInfoAndFilePair``):
+
+      [0..19]                20-byte head (``file_tag = 0x55``)
+      [20..23]               4-byte big-endian ``pb_size``
+      [24..24+pb_size]       ``file_download`` protobuf
+      [24+pb_size..]         ``file_size`` bytes of raw file content
+    """
+    if len(buf) < HEADER_SIZE + 4:
+        return None
+    pb_size = (
+        (buf[HEADER_SIZE] << 24)
+        | (buf[HEADER_SIZE + 1] << 16)
+        | (buf[HEADER_SIZE + 2] << 8)
+        | buf[HEADER_SIZE + 3]
+    )
+    pb_end = HEADER_SIZE + 4 + pb_size
+    if len(buf) < pb_end:
+        return None
+    file_size = parse_file_download_size(bytes(buf[HEADER_SIZE + 4 : pb_end]))
+    return pb_end + file_size
+
+
 RESERVED_BYTE: Final[int] = 0xFF  # default fill for unset fields
 RESERVED_PAD_LENGTH: Final[int] = 8  # PbFrame reserved-pad length (offsets 11..18).
 CONFIRM_RESERVED_PAD_LENGTH: Final[int] = 11  # ConfirmFrame reserved-pad length (offsets 8..18).
@@ -259,9 +374,33 @@ def parse_frame(buf: bytes) -> Frame:
 
 
 def _parse_pb_frame(buf: bytes) -> Frame:
-    if buf[HDR_END_MARKER] != TYPE_PB:
+    # end_marker (offset 10) is 0x01 (END_TYPE_PB) for ordinary
+    # request/response PbFrames; the chunked file-transfer path
+    # additionally uses 0x02 ("continue") and 0x03 ("last chunk") in
+    # the same byte slot. The BSC200's CYCLING_DATA FILE_GET reply uses
+    # 0x03 — see PROTOCOL.md §6.4 (Activity download). Accept all
+    # three so a parsed Frame can carry the marker out.
+    end_marker = buf[HDR_END_MARKER]
+    if end_marker not in (TYPE_PB, _END_MARKER_CONTINUE, _END_MARKER_LAST):
         raise FrameError(
-            f"unexpected end_marker byte: 0x{buf[HDR_END_MARKER]:02X} (want 0x{TYPE_PB:02X})"
+            f"unexpected end_marker byte: 0x{end_marker:02X} "
+            f"(want 0x{TYPE_PB:02X}/0x{_END_MARKER_CONTINUE:02X}/0x{_END_MARKER_LAST:02X})"
+        )
+    if is_transmit_complete_head(buf):
+        # file_tag=0x55 transmit-complete download. The head's
+        # ``payload_size`` is *not* the actual stream length — the
+        # real length is computed from the embedded file_download
+        # protobuf. Hand the entire post-header buffer through as
+        # the payload; consumers split it into pb_size + pbInfo +
+        # file content themselves.
+        return Frame(
+            type=TYPE_PB,
+            service=buf[HDR_SERVICE],
+            operation=buf[HDR_OPERATION],
+            sub_service=buf[HDR_SUB_SERVICE],
+            sub_operation=buf[HDR_SUB_OPERATION],
+            file_tag=buf[HDR_FILE_TAG],
+            payload=bytes(buf[HEADER_SIZE:]),
         )
     size = (buf[HDR_PAYLOAD_SIZE] << 8) | buf[HDR_PAYLOAD_SIZE + 1]
     expected_total = HEADER_SIZE + size
@@ -286,17 +425,24 @@ def _parse_pb_frame(buf: bytes) -> Frame:
     )
 
 
-def expected_total_size(header: bytes) -> int:
+def expected_total_size(header: bytes) -> int | None:
     """Total frame size in bytes from a 20-byte header buffer.
 
     Used by the BLE reassembly loop in :mod:`ligpsport.ble` to know
     when to stop accumulating chunks before validating with
-    :func:`parse_frame`.
+    :func:`parse_frame`. Returns ``None`` for transmit-complete
+    download heads (``file_tag = 0x55``) — the head alone doesn't
+    carry the true stream length; callers must call
+    :func:`transmit_complete_total_size` on the accumulating buffer
+    until it returns an int (i.e., enough of the embedded
+    ``file_download`` protobuf has arrived).
     """
     if len(header) < HEADER_SIZE:
         raise FrameError(f"header too short: {len(header)} < {HEADER_SIZE}")
     type_byte = header[HDR_TYPE]
     if type_byte == TYPE_PB:
+        if is_transmit_complete_head(header):
+            return None
         return HEADER_SIZE + ((header[HDR_PAYLOAD_SIZE] << 8) | header[HDR_PAYLOAD_SIZE + 1])
     if type_byte in (TYPE_CONFIRM, TYPE_REQUEST):
         return HEADER_SIZE

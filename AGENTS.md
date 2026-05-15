@@ -49,6 +49,20 @@ Hard rules:
   `allow_destructive=True`.
 * **`run_named(..., allow_destructive=False)` is the default.** The
   CLI exposes the same gate as `--allow-destructive-commands`.
+* **Speculative wire-format probes against the real device count as
+  destructive even when the op itself isn't in `DESTRUCTIVE_PREFIXES`.**
+  In particular: never send a non-default `file_tag` (offset 3 of the
+  20-byte head — see `framing.FILE_TAG_*`) on a service it wasn't
+  designed for. The BSC200 firmware classifies certain `file_tag`
+  values as upload-stream markers (`0xAA` for FILE_OPERATION ADD,
+  `0x55` for CYCLING_DATA FILE_GET transmit-complete) and will park
+  its parser waiting for the rest of an upload that never arrives;
+  the only recovery is a power-cycle. Verified the hard way 2026-05-15:
+  a probe combining `op = FILE_DEL (5)` with `file_tag = 0xAA` on the
+  third UART wedged the device for ~1 h. Always test new wire-format
+  variants in the simulator first; if you must try them live, use
+  the read-only services (DEV_VER_INFO / DEV_STATUS) and stick to
+  the default `file_tag = 0xFF`.
 
 When adding a new destructive command:
 
