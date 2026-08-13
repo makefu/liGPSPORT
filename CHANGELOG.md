@@ -6,6 +6,35 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.2] — 2026-08-13
+
+Toolchain release: the strict mypy gate is green for the first time
+and now runs in CI. No runtime, wire-protocol or CLI changes.
+
+### Fixed
+- `mypy --strict ligpsport/` passes. `nix run .#gen-proto` now also
+  emits `*_pb2.pyi` stubs (committed alongside the runtime modules),
+  which removes the ~200 `Module has no attribute` errors the
+  builder-generated protobuf modules produced, and the 28 genuine
+  findings underneath were fixed at the source: protobuf enum fields
+  are declared with their generated enum types, `envelope` and
+  `commands` state their duck-typed contracts as Protocols,
+  `_send_file_use` takes a `Queue[Response]`, and the dead
+  `import-not-found` ignores for bleak / dbus_fast are gone.
+  This closes the "mypy gating is deferred" known issue carried
+  since 0.1.0.
+
+### Added
+- `.github/workflows/ci.yml` — runs `nix build .#default` and
+  `nix flake check` on every push to `main`, every `v*` tag and
+  every pull request. The repo documented this gate from the start
+  but had no workflow; PR #1 merged with nothing having built it.
+
+### Documentation
+- AGENTS.md §5 documents that the `.pyi` stubs are generated **and**
+  committed, and that protobuf enum wrappers are not callable at
+  runtime — use the generated `enum_*` constants, not bare ints.
+
 ## [1.5.1] — 2026-08-13
 
 Patch release: the BlueZ backend printed an asyncio warning after
