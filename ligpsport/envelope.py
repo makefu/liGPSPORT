@@ -22,7 +22,7 @@ proto class to instantiate when synthesising a response.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, Protocol, cast
 
 from google.protobuf.message import Message
 
@@ -118,6 +118,20 @@ def service_type_for(msg_cls: type[Message]) -> int:
     return idx
 
 
+class _ServiceMessage(Protocol):
+    """The shape every message in :data:`SERVICE_MESSAGES` shares.
+
+    ``service_type`` is declared on each per-service message in the
+    ``.proto`` files, but the common :class:`Message` base doesn't know
+    about it. Rather than reaching through the base class untyped, we
+    state the contract the registry already guarantees.
+    """
+
+    service_type: int
+
+    def HasField(self, field_name: str) -> bool: ...
+
+
 def encode_message(msg: Message) -> tuple[int, bytes]:
     """Serialise a message; return ``(service_type, payload_bytes)``.
 
@@ -129,10 +143,13 @@ def encode_message(msg: Message) -> tuple[int, bytes]:
     the service_type its message belongs to).
     """
     service_type = service_type_for(type(msg))
-    if not msg.HasField("service_type"):
-        msg.service_type = service_type
+    # Every class in SERVICE_MESSAGES declares service_type; the
+    # protobuf Message base does not.
+    svc = cast("_ServiceMessage", msg)
+    if not svc.HasField("service_type"):
+        svc.service_type = service_type
     else:
-        observed = int(msg.service_type)
+        observed = int(svc.service_type)
         if observed != service_type:
             raise ValueError(
                 f"message {type(msg).__name__} has service_type={observed}, "

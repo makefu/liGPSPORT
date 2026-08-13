@@ -119,6 +119,20 @@ or silencing. Generated protobuf modules under `ligpsport/proto/`
 have an `ignore_errors` override in `pyproject.toml`; nothing else
 gets a pass.
 
+`nix run .#gen-proto` emits both `*_pb2.py` and `*_pb2.pyi`, and
+**both are committed**. The stubs are what makes the rest of the
+tree type-check: the runtime modules build their message classes
+through the protobuf builder, so without stubs mypy reports every
+message and enum as `Module has no attribute`. Never hand-edit
+either — change the `.proto` and regenerate.
+
+Protobuf enum fields are typed as their generated enum class (e.g.
+`ROUTE_PLAN_FILE_TYPE`), which is an `int` subclass. Assigning a
+bare `int` to one is a type error. Use the generated constant
+(`route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_CNX`) rather than a
+literal; the enum wrappers are *not* callable at runtime, so
+`ROUTE_PLAN_FILE_TYPE(2)` raises `TypeError`.
+
 ## 6. Naming, versioning, releases
 
 * The project, the GitHub repo, the Nix flake attribute, the CLI

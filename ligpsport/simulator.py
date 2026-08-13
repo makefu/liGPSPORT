@@ -25,7 +25,7 @@ import contextlib
 import dataclasses
 import logging
 from collections.abc import Callable, Coroutine
-from typing import Final
+from typing import Final, cast
 
 from google.protobuf.message import Message
 
@@ -74,6 +74,9 @@ class UploadedRouteFile:
     """An accumulated route file received via a multi-chunk upload."""
 
     file_id: int
+    # Wire value of whichever enum the upload path carried:
+    # ROUTE_PLAN_FILE_TYPE for the chunked route-plan upload,
+    # file_operation_type for the FILE_OPERATION (CNX) upload.
     file_type: int
     name: str
     extension: str
@@ -86,9 +89,9 @@ class UploadedRouteFile:
 class SimulatedSensor:
     """One entry in the simulator's paired-sensor list."""
 
-    sensor_type: int  # enum SENSOR_TYPE
-    sensor_radio_type: int = 1  # BLE
-    sensor_status_type: int = 1  # CONNECTED
+    sensor_type: sensor_pb2.SENSOR_TYPE
+    sensor_radio_type: sensor_pb2.SENSOR_RADIO_TYPE = sensor_pb2.enum_SENSOR_RADIO_TYPE_BLE
+    sensor_status_type: sensor_pb2.SENSOR_STATUS_TYPE = sensor_pb2.enum_SENSOR_STATUS_TYPE_CONNECTED
     sensor_key: str = ""
     sensor_ble_name: str = ""
     sensor_pwr: int = 0
@@ -114,7 +117,7 @@ class SimulatorState:
     compile_time: str = "2026-01-01 00:00:00"
 
     # Cycling status (DEV_STATUS service).
-    cycling_status: int = 0
+    cycling_status: dev_status_pb2.DEV_CYCLING_STATUS = dev_status_pb2.DEV_CYCLING_STATUS_FREE
     cycling_start_time: int = 0
     latitude: float = 0.0
     longitude: float = 0.0
@@ -129,8 +132,8 @@ class SimulatorState:
     cur_height_cm: int = 0
     cur_slope: int = 0
     course: int = 0
-    wifi_status: int = 1  # IDLE
-    navi_status: int = 0
+    wifi_status: dev_status_pb2.DEV_WIFI_STATUS = dev_status_pb2.DEV_WIFI_STATUS_IDLE
+    navi_status: dev_status_pb2.DEV_NAVI_STATUS = dev_status_pb2.DEV_NAVI_STATUS_OFF
 
     # User profile (USER_CONFIG service).
     user_sex: int = 1
@@ -389,7 +392,7 @@ async def _handle_route_plan(
     for entry in state.uploaded_routes:
         info = reply.route_plan_info_msg.add()
         info.id = entry.file_id
-        info.file_type = entry.file_type
+        info.file_type = cast("route_plan_pb2.ROUTE_PLAN_FILE_TYPE", entry.file_type)
         info.name = entry.name
         info.total_distance = entry.total_distance
         info.status = (
@@ -938,7 +941,7 @@ class Simulator:
         for entry in self.state.uploaded_routes:
             if entry.file_id == used_id:
                 self.state.active_route_id = used_id
-                self.state.navi_status = 1  # DEV_NAVI_STATUS_ON
+                self.state.navi_status = dev_status_pb2.DEV_NAVI_STATUS_ON
                 found = True
                 break
         ack = framing.build_frame(

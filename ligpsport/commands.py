@@ -16,7 +16,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Final
+from typing import Final, Protocol, runtime_checkable
 
 from . import client as _client
 from . import file_transfer, fit_activity
@@ -85,9 +85,23 @@ class CommandResult:
         return _format(self.value)
 
 
+@runtime_checkable
+class _HasToDict(Protocol):
+    """Result dataclasses expose to_dict(); see AGENTS.md §4."""
+
+    def to_dict(self) -> object: ...
+
+
+@runtime_checkable
+class _HasFormat(Protocol):
+    """Result dataclasses expose format(); see AGENTS.md §4."""
+
+    def format(self) -> str: ...
+
+
 def _jsonable(value: object) -> object:
-    if hasattr(value, "to_dict"):
-        return value.to_dict()  # type: ignore[union-attr]
+    if isinstance(value, _HasToDict):
+        return value.to_dict()
     if isinstance(value, list | tuple):
         return [_jsonable(v) for v in value]
     if isinstance(value, dict):
@@ -96,8 +110,8 @@ def _jsonable(value: object) -> object:
 
 
 def _format(value: object) -> str:
-    if hasattr(value, "format"):
-        return value.format()  # type: ignore[union-attr]
+    if isinstance(value, _HasFormat):
+        return value.format()
     if isinstance(value, dict | list):
         return json.dumps(_jsonable(value), indent=2, sort_keys=True)
     return str(value)

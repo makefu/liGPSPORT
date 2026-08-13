@@ -136,7 +136,7 @@ nix flake check
 # Dev shell with python + pytest + bleak + ruff + protoc + bluez.
 nix develop
 
-# Regenerate protobuf modules after touching reference/*.proto.
+# Regenerate protobuf modules (+ .pyi stubs) after touching reference/*.proto.
 nix run .#gen-proto
 
 # Live-device tests (gated on env var).

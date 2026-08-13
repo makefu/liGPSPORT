@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from . import framing, gatt
 from .transport import Channel, Transport, TransportClosed
@@ -91,7 +91,9 @@ class BleakTransport(Transport):
         # Without this, every write fires bleak's
         # "Using default MTU value" UserWarning from
         # bleak/backends/bluezdbus/client.py.
-        backend = getattr(client, "_backend", client)
+        # Private bleak internals, probed dynamically — Any is the
+        # honest type here; every access below is getattr-guarded.
+        backend: Any = getattr(client, "_backend", client)
         acquire_mtu = getattr(backend, "_acquire_mtu", None)
         if acquire_mtu is not None:
             try:
@@ -111,7 +113,7 @@ class BleakTransport(Transport):
         # without lying about the link-layer MTU since the kernel
         # fragments writes that exceed the negotiated value.
         if getattr(backend, "_mtu_size", None) in (None, 0):
-            backend._mtu_size = self._FALLBACK_MTU  # type: ignore[attr-defined]
+            backend._mtu_size = self._FALLBACK_MTU
             _LOG.info("forcing _mtu_size=%d as fallback", self._FALLBACK_MTU)
         # Subscribe to TX on every channel. The BSC200 receives on the
         # Control RX (8e) but emits responses on the Data TX (9e), and

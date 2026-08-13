@@ -49,7 +49,7 @@ async def discover(*, timeout: float = 6.0) -> list[Device]:
     """
     # Lazy import so test environments without a BLE stack still load
     # this module.
-    from bleak import BleakScanner  # type: ignore[import-not-found]
+    from bleak import BleakScanner
 
     seen: dict[str, Device] = {}
 
@@ -88,7 +88,7 @@ async def watch(*, max_count: int | None = None) -> AsyncIterator[Device]:
     """
     import asyncio as _asyncio
 
-    from bleak import BleakScanner  # type: ignore[import-not-found]
+    from bleak import BleakScanner
 
     queue: _asyncio.Queue[Device] = _asyncio.Queue()
     seen: set[str] = set()

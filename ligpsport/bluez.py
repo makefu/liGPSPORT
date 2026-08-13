@@ -41,7 +41,7 @@ import asyncio
 import contextlib
 import logging
 import os
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from . import framing, gatt
 from .transport import Channel, Transport, TransportClosed
@@ -247,8 +247,8 @@ class BluezTransport(Transport):
         """Connect to BlueZ, discover, acquire MTU-aware FDs."""
         # Lazy import: dbus_fast pulls in a binary extension. Code paths
         # that only use LoopbackTransport (tests) should not pay for it.
-        from dbus_fast import BusType  # type: ignore[import-not-found]
-        from dbus_fast.aio import MessageBus  # type: ignore[import-not-found]
+        from dbus_fast import BusType
+        from dbus_fast.aio import MessageBus
 
         # Drop the benign dbus-fast reader EOFError before it reaches
         # the user. The filter stays installed for the rest of the
@@ -474,7 +474,7 @@ class BluezTransport(Transport):
         proxy = bus.get_proxy_object(BLUEZ_SERVICE, path, introspection)  # type: ignore[attr-defined]
         return proxy.get_interface(iface)
 
-    async def _get_managed_objects(self, bus: object) -> dict[str, dict[str, dict]]:
+    async def _get_managed_objects(self, bus: object) -> dict[str, dict[str, dict[str, Any]]]:
         introspection = await bus.introspect(BLUEZ_SERVICE, "/")  # type: ignore[attr-defined]
         proxy = bus.get_proxy_object(BLUEZ_SERVICE, "/", introspection)  # type: ignore[attr-defined]
         om = proxy.get_interface(DBUS_OM_IFACE)
@@ -483,7 +483,7 @@ class BluezTransport(Transport):
 
     @staticmethod
     def _index_chars_by_uuid(
-        managed: dict[str, dict[str, dict]], device_path: str
+        managed: dict[str, dict[str, dict[str, Any]]], device_path: str
     ) -> dict[str, str]:
         """Walk the ObjectManager tree and return {char_uuid: object_path}.
 

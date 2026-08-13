@@ -73,7 +73,7 @@ from .proto import common_pb2, cycling_data_pb2, factory_pb2, route_plan_pb2
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from .client import IgpsportClient
+    from .client import IgpsportClient, Response
     from .cnx import Waypoint
     from .routes import RouteData
     from .transport import Channel
@@ -132,10 +132,10 @@ _DEFAULT_CHUNK_SIZE: Final[int] = 512
 
 # Protobuf enum values, mirrored here so the upload code stays
 # self-contained even if the generated module's enum aliasing changes.
-_ROUTE_PLAN_OPERATE_TYPE_FILE_SEND: Final[int] = (
+_ROUTE_PLAN_OPERATE_TYPE_FILE_SEND: Final[route_plan_pb2.ROUTE_PLAN_OPERATE_TYPE] = (
     route_plan_pb2.enum_ROUTE_PLAN_OPERATE_TYPE_FILE_SEND
 )
-_ROUTE_PLAN_FILE_TYPE_BY_EXT: Final[dict[str, int]] = {
+_ROUTE_PLAN_FILE_TYPE_BY_EXT: Final[dict[str, route_plan_pb2.ROUTE_PLAN_FILE_TYPE]] = {
     "cnx": route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_CNX,
     "gpx": route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_GPX,
     "fit": route_plan_pb2.enum_ROUTE_PLAN_FILE_TYPE_FIT,
@@ -727,7 +727,7 @@ async def _send_file_use(
     timeout: float,
     name: str | None = None,
     total_distance: int = 0,
-    existing_queue: asyncio.Queue[object] | None = None,
+    existing_queue: asyncio.Queue[Response] | None = None,
 ) -> int:
     """Send a ``ROUTE_PLAN FILE_USE`` and return the device's status byte.
 
@@ -771,7 +771,7 @@ async def _send_file_use(
         queue = await client.open_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN)
         owns_queue = True
     else:
-        queue = existing_queue  # type: ignore[assignment]
+        queue = existing_queue
         owns_queue = False
     try:
         if generation >= 4:
@@ -789,7 +789,7 @@ async def _send_file_use(
     finally:
         if owns_queue:
             await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN, queue)
-    status = response.frame.status  # type: ignore[attr-defined]
+    status = response.frame.status
     _LOG.debug("FILE_USE: status=%d (%s)", status, _status_name(status))
     return int(status)
 
@@ -1302,7 +1302,7 @@ async def delete_route_plan_files(
         response = await asyncio.wait_for(queue.get(), timeout=timeout)
     finally:
         await client.close_subscription(common_pb2.enum_SERVICE_TYPE_INDEX_ROUTE_PLAN, queue)
-    status = response.frame.status  # type: ignore[attr-defined]
+    status = response.frame.status
     _LOG.debug(
         "FILES_DEL: %d ids → status=%d (%s)",
         len(files),

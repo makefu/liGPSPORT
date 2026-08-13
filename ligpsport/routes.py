@@ -217,7 +217,13 @@ def _select_feature(doc: object) -> object | None:
         return None
     t = doc.get("type")
     if t == "FeatureCollection":
-        for feat in doc.get("features", ()):
+        features: object = doc.get("features", ())
+        if not isinstance(features, list):
+            return None
+        for entry in features:
+            # `entry` comes out of json.load as Any; pin it to object so
+            # the declared return type stays honest.
+            feat: object = entry
             if _geometry_of(feat) is not None:
                 return feat
         return None

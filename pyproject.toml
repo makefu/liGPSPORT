@@ -51,7 +51,10 @@ python_version = "3.11"
 strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true
-# Generated protobuf modules don't type-check cleanly with --strict
+# The generated ``*_pb2.py`` modules build their classes at import
+# time; the committed ``*_pb2.pyi`` stubs (see ``nix run .#gen-proto``)
+# are what mypy reads. The runtime modules themselves are not ours to
+# fix, so errors in them stay ignored.
 [[tool.mypy.overrides]]
 module = "ligpsport.proto.*"
 ignore_errors = true

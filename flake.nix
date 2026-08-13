@@ -80,6 +80,14 @@
         # (`import common_pb2 as ...`) into package-relative form
         # (`from . import common_pb2 as ...`) so the modules are usable
         # under the `ligpsport.proto` namespace.
+        #
+        # `--pyi_out` is what makes the generated modules type-check:
+        # the runtime `_pb2.py` files build their message classes
+        # dynamically through the protobuf builder, so mypy sees an
+        # empty module and reports every message and enum as
+        # `Module has no attribute`. The `.pyi` stubs declare them
+        # statically. They're generated, but committed alongside the
+        # `.py` — regenerate both together.
         genProto = pkgs.writeShellApplication {
           name = "ligpsport-gen-proto";
           runtimeInputs = [ pkgs.protobuf pkgs.gnused ];
@@ -92,9 +100,9 @@
             (
               cd "$REF_DIR"
               # shellcheck disable=SC2046
-              protoc --proto_path=. --python_out="$OUT_DIR" $(ls ./*.proto)
+              protoc --proto_path=. --python_out="$OUT_DIR" --pyi_out="$OUT_DIR" $(ls ./*.proto)
             )
-            for f in "$OUT_DIR"/*_pb2.py; do
+            for f in "$OUT_DIR"/*_pb2.py "$OUT_DIR"/*_pb2.pyi; do
               sed -i -E 's/^import (.+_pb2)( as .+)?$/from . import \1\2/' "$f"
             done
             echo "Generated protobuf modules into $OUT_DIR"
