@@ -112,7 +112,8 @@ and `nix flake check` adds the standalone mypy derivation:
 4. `pytest tests/ -q -m "not bsc200"`
 
 Run `nix build .#default --print-build-logs` before every commit.
-CI runs exactly the same command on every push and PR.
+CI (`.github/workflows/ci.yml`) runs exactly those two commands on
+every push to `main`, every tag and every PR.
 
 Fix lint and type errors at the root, never with `# type: ignore`
 or silencing. Generated protobuf modules under `ligpsport/proto/`

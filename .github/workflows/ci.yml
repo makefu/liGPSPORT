@@ -1,0 +1,33 @@
+# The single QA gate, run exactly as AGENTS.md §5 describes it:
+# `nix build .#default` is lint + format + tests, `nix flake check`
+# adds the strict mypy derivation. Live-device tests (the `bsc200`
+# marker) are excluded by pyproject's addopts and can't run here —
+# there is no BSC200 attached to a GitHub runner.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Build (ruff check, ruff format --check, pytest)
+        run: nix build .#default --print-build-logs
+      - name: Flake check (adds mypy --strict)
+        run: nix flake check --print-build-logs
