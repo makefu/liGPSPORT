@@ -6,6 +6,29 @@ the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-08-13
+
+Patch release: the BlueZ backend printed an asyncio warning after
+otherwise successful transfers. Wire protocol, CLI surface and
+library API are unchanged.
+
+### Fixed
+- `BluezTransport` no longer surfaces
+  "Future exception was never retrieved" after a completed upload.
+  dbus-fast's compiled reader sets an `EOFError` on an internal
+  future when the DBus socket closes during teardown; with no
+  awaiter left, asyncio reported it at GC time — after the transfer
+  had already succeeded. The loop's exception handler is now wrapped
+  by a filter that drops exactly that case (an `EOFError` raised
+  from a `dbus_fast` frame) and delegates everything else.
+  Reported and fixed by Julian Oes (#1).
+- The filter installs idempotently, so a reconnect or a second
+  transport on the same event loop reuses it instead of stacking
+  wrappers — the wrapper is never uninstalled (the warning can fire
+  after `close()` returns, during `asyncio.run` cleanup), so each
+  extra layer would otherwise sit in the call path of every
+  unrelated loop error for the loop's remaining lifetime.
+
 ## [1.5.0] — 2026-05-16
 
 The library shipped two parallel CLI vocabularies for recorded
